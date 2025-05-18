@@ -490,7 +490,7 @@ func (p *Package) guessKinds(f *File) []*Name {
 				// Don't report an error, and skip adding n to the needType array.
 				continue
 			}
-			error_(f.NamePos[n], "could not determine kind of name for C.%s", fixGo(n.Go))
+			error_(f.NamePos[n], "could not determine what C.%s refers to", fixGo(n.Go))
 		case notStrLiteral | notType:
 			n.Kind = "iconst"
 		case notIntConst | notStrLiteral | notType:
@@ -2863,7 +2863,7 @@ func (c *typeConv) loadType(dtype dwarf.Type, pos token.Pos, parent string) *Typ
 			if ss, ok := dwarfToName[s]; ok {
 				s = ss
 			}
-			s = strings.Replace(s, " ", "", -1)
+			s = strings.ReplaceAll(s, " ", "")
 			name := c.Ident("_Ctype_" + s)
 			tt := *t
 			typedef[name.Name] = &tt

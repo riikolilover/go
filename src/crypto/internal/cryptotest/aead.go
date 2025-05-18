@@ -108,7 +108,7 @@ func TestAEAD(t *testing.T, mAEAD MakeAEAD) {
 
 		// Test all combinations of plaintext and additional data lengths.
 		for _, ptLen := range lengths {
-			if ptLen <= 1 { // We need enough room for an overlap to occur.
+			if ptLen <= 1 { // We need enough room for an inexact overlap to occur.
 				continue
 			}
 			for _, adLen := range lengths {
@@ -196,7 +196,7 @@ func TestAEAD(t *testing.T, mAEAD MakeAEAD) {
 						rng.Read(longBuff)
 						prefixes := [][]byte{shortBuff, longBuff}
 
-						// Check each prefix gets appended to by Seal with altering them.
+						// Check each prefix gets appended to by Seal without altering them.
 						for _, prefix := range prefixes {
 							plaintext, addData := make([]byte, ptLen), make([]byte, adLen)
 							rng.Read(plaintext)
@@ -208,10 +208,12 @@ func TestAEAD(t *testing.T, mAEAD MakeAEAD) {
 								t.Errorf("Seal alters dst instead of appending; got %s, want %s", truncateHex(out[:len(prefix)]), truncateHex(prefix))
 							}
 
-							ciphertext := out[len(prefix):]
-							// Check that the appended ciphertext wasn't affected by the prefix
-							if expectedCT := sealMsg(t, aead, nil, nonce, plaintext, addData); !bytes.Equal(ciphertext, expectedCT) {
-								t.Errorf("Seal behavior affected by pre-existing data in dst; got %s, want %s", truncateHex(ciphertext), truncateHex(expectedCT))
+							if isDeterministic(aead) {
+								ciphertext := out[len(prefix):]
+								// Check that the appended ciphertext wasn't affected by the prefix
+								if expectedCT := sealMsg(t, aead, nil, nonce, plaintext, addData); !bytes.Equal(ciphertext, expectedCT) {
+									t.Errorf("Seal behavior affected by pre-existing data in dst; got %s, want %s", truncateHex(ciphertext), truncateHex(expectedCT))
+								}
 							}
 						}
 					})
@@ -227,7 +229,7 @@ func TestAEAD(t *testing.T, mAEAD MakeAEAD) {
 						rng.Read(longBuff)
 						prefixes := [][]byte{shortBuff, longBuff}
 
-						// Check each prefix gets appended to by Open with altering them.
+						// Check each prefix gets appended to by Open without altering them.
 						for _, prefix := range prefixes {
 							before, addData := make([]byte, adLen), make([]byte, ptLen)
 							rng.Read(before)
@@ -254,7 +256,9 @@ func TestAEAD(t *testing.T, mAEAD MakeAEAD) {
 	})
 
 	t.Run("WrongNonce", func(t *testing.T) {
-
+		if aead.NonceSize() == 0 {
+			t.Skip("AEAD does not use a nonce")
+		}
 		// Test all combinations of plaintext and additional data lengths.
 		for _, ptLen := range lengths {
 			for _, adLen := range lengths {
@@ -370,6 +374,18 @@ func sealMsg(t *testing.T, aead cipher.AEAD, ciphertext, nonce, plaintext, addDa
 	}
 
 	return ciphertext
+}
+
+func isDeterministic(aead cipher.AEAD) bool {
+	// Check if the AEAD is deterministic by checking if the same plaintext
+	// encrypted with the same nonce and additional data produces the same
+	// ciphertext.
+	nonce := make([]byte, aead.NonceSize())
+	addData := []byte("additional data")
+	plaintext := []byte("plaintext")
+	ciphertext1 := aead.Seal(nil, nonce, plaintext, addData)
+	ciphertext2 := aead.Seal(nil, nonce, plaintext, addData)
+	return bytes.Equal(ciphertext1, ciphertext2)
 }
 
 // Helper function to Open and authenticate ciphertext. Checks that Open

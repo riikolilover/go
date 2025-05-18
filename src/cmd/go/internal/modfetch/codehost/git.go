@@ -59,6 +59,7 @@ func newGitRepo(ctx context.Context, remote string, local bool) (Repo, error) {
 		}
 		r.dir = remote
 		r.mu.Path = r.dir + ".lock"
+		r.sha256Hashes = r.checkConfigSHA256(ctx)
 		return r, nil
 	}
 	// This is a remote path lookup.
@@ -81,7 +82,20 @@ func newGitRepo(ctx context.Context, remote string, local bool) (Repo, error) {
 	defer unlock()
 
 	if _, err := os.Stat(filepath.Join(r.dir, "objects")); err != nil {
-		if _, err := Run(ctx, r.dir, "git", "init", "--bare"); err != nil {
+		repoSha256Hash := false
+		if refs, lrErr := r.loadRefs(ctx); lrErr == nil {
+			// Check any ref's hash, it doesn't matter which; they won't be mixed
+			// between sha1 and sha256 for the moment.
+			for _, refHash := range refs {
+				repoSha256Hash = len(refHash) == (256 / 4)
+				break
+			}
+		}
+		objFormatFlag := []string{}
+		if repoSha256Hash {
+			objFormatFlag = []string{"--object-format=sha256"}
+		}
+		if _, err := Run(ctx, r.dir, "git", "init", "--bare", objFormatFlag); err != nil {
 			os.RemoveAll(r.dir)
 			return nil, err
 		}
@@ -109,6 +123,7 @@ func newGitRepo(ctx context.Context, remote string, local bool) (Repo, error) {
 			}
 		}
 	}
+	r.sha256Hashes = r.checkConfigSHA256(ctx)
 	r.remoteURL = r.remote
 	r.remote = "origin"
 	return r, nil
@@ -118,8 +133,11 @@ type gitRepo struct {
 	ctx context.Context
 
 	remote, remoteURL string
-	local             bool
+	local             bool // local only lookups; no remote fetches
 	dir               string
+
+	// Repo uses the SHA256 for hashes, so expect the hashes to be 256/4 == 64-bytes in hex.
+	sha256Hashes bool
 
 	mu lockedfile.Mutex // protects fetchLevel and git repo state
 
@@ -216,6 +234,11 @@ func (r *gitRepo) CheckReuse(ctx context.Context, old *Origin, subdir string) er
 // loadRefs loads heads and tags references from the remote into the map r.refs.
 // The result is cached in memory.
 func (r *gitRepo) loadRefs(ctx context.Context) (map[string]string, error) {
+	if r.local { // Return results from the cache if local only.
+		// In the future, we could consider loading r.refs using local git commands
+		// if desired.
+		return nil, nil
+	}
 	r.refsOnce.Do(func() {
 		// The git protocol sends all known refs and ls-remote filters them on the client side,
 		// so we might as well record both heads and tags in one shot.
@@ -314,7 +337,7 @@ func (r *gitRepo) Tags(ctx context.Context, prefix string) (*Tags, error) {
 // the absence of a specific module version.
 // The caller must supply refs, the result of a successful r.loadRefs.
 func (r *gitRepo) repoSum(refs map[string]string) string {
-	var list []string
+	list := make([]string, 0, len(refs))
 	for ref := range refs {
 		list = append(list, ref)
 	}
@@ -381,6 +404,32 @@ func (r *gitRepo) findRef(ctx context.Context, hash string) (ref string, ok bool
 	return "", false
 }
 
+func (r *gitRepo) checkConfigSHA256(ctx context.Context) bool {
+	if hashType, sha256CfgErr := r.runGit(ctx, "git", "config", "extensions.objectformat"); sha256CfgErr == nil {
+		return "sha256" == strings.TrimSpace(string(hashType))
+	}
+	return false
+}
+
+func (r *gitRepo) hexHashLen() int {
+	if !r.sha256Hashes {
+		return 160 / 4
+	}
+	return 256 / 4
+}
+
+// shortenObjectHash shortens a SHA1 or SHA256 hash (40 or 64 hex digits) to
+// the canonical length used in pseudo-versions (12 hex digits).
+func (r *gitRepo) shortenObjectHash(rev string) string {
+	if !r.sha256Hashes {
+		return ShortenSHA1(rev)
+	}
+	if AllHex(rev) && len(rev) == 256/4 {
+		return rev[:12]
+	}
+	return rev
+}
+
 // minHashDigits is the minimum number of digits to require
 // before accepting a hex digit sequence as potentially identifying
 // a specific commit in a git repo. (Of course, users can always
@@ -392,13 +441,9 @@ const minHashDigits = 7
 // stat stats the given rev in the local repository,
 // or else it fetches more info from the remote repository and tries again.
 func (r *gitRepo) stat(ctx context.Context, rev string) (info *RevInfo, err error) {
-	if r.local {
-		return r.statLocal(ctx, rev, rev)
-	}
-
 	// Fast path: maybe rev is a hash we already have locally.
 	didStatLocal := false
-	if len(rev) >= minHashDigits && len(rev) <= 40 && AllHex(rev) {
+	if len(rev) >= minHashDigits && len(rev) <= r.hexHashLen() && AllHex(rev) {
 		if info, err := r.statLocal(ctx, rev, rev); err == nil {
 			return info, nil
 		}
@@ -414,7 +459,8 @@ func (r *gitRepo) stat(ctx context.Context, rev string) (info *RevInfo, err erro
 
 	// Maybe rev is the name of a tag or branch on the remote server.
 	// Or maybe it's the prefix of a hash of a named ref.
-	// Try to resolve to both a ref (git name) and full (40-hex-digit) commit hash.
+	// Try to resolve to both a ref (git name) and full (40-hex-digit for
+	// sha1 64 for sha256) commit hash.
 	refs, err := r.loadRefs(ctx)
 	if err != nil {
 		return nil, err
@@ -435,7 +481,7 @@ func (r *gitRepo) stat(ctx context.Context, rev string) (info *RevInfo, err erro
 		ref = "HEAD"
 		hash = refs[ref]
 		rev = hash // Replace rev, because meaning of HEAD can change.
-	} else if len(rev) >= minHashDigits && len(rev) <= 40 && AllHex(rev) {
+	} else if len(rev) >= minHashDigits && len(rev) <= r.hexHashLen() && AllHex(rev) {
 		// At the least, we have a hash prefix we can look up after the fetch below.
 		// Maybe we can map it to a full hash using the known refs.
 		prefix := rev
@@ -454,7 +500,7 @@ func (r *gitRepo) stat(ctx context.Context, rev string) (info *RevInfo, err erro
 				hash = h
 			}
 		}
-		if hash == "" && len(rev) == 40 { // Didn't find a ref, but rev is a full hash.
+		if hash == "" && len(rev) == r.hexHashLen() { // Didn't find a ref, but rev is a full hash.
 			hash = rev
 		}
 	} else {
@@ -499,6 +545,10 @@ func (r *gitRepo) stat(ctx context.Context, rev string) (info *RevInfo, err erro
 		}
 	}
 
+	if r.local { // at this point, we have determined that we need to fetch rev, fail early if local only mode.
+		return nil, fmt.Errorf("revision does not exist locally: %s", rev)
+	}
+
 	// If we know a specific commit we need and its ref, fetch it.
 	// We do NOT fetch arbitrary hashes (when we don't know the ref)
 	// because we want to avoid ever importing a commit that isn't
@@ -506,7 +556,7 @@ func (r *gitRepo) stat(ctx context.Context, rev string) (info *RevInfo, err erro
 	// Both Gerrit and GitHub expose every CL/PR as a named ref,
 	// and we don't want those commits masquerading as being real
 	// pseudo-versions in the main repo.
-	if r.fetchLevel <= fetchSome && ref != "" && hash != "" && !r.local {
+	if r.fetchLevel <= fetchSome && ref != "" && hash != "" {
 		r.fetchLevel = fetchSome
 		var refspec string
 		if ref == "HEAD" {
@@ -563,6 +613,9 @@ func (r *gitRepo) stat(ctx context.Context, rev string) (info *RevInfo, err erro
 //
 // fetchRefsLocked requires that r.mu remain locked for the duration of the call.
 func (r *gitRepo) fetchRefsLocked(ctx context.Context) error {
+	if r.local {
+		panic("go: fetchRefsLocked called in local only mode.")
+	}
 	if r.fetchLevel < fetchAll {
 		// NOTE: To work around a bug affecting Git clients up to at least 2.23.0
 		// (2019-08-16), we must first expand the set of local refs, and only then
@@ -623,7 +676,7 @@ func (r *gitRepo) statLocal(ctx context.Context, version, rev string) (*RevInfo,
 			Hash: hash,
 		},
 		Name:    hash,
-		Short:   ShortenSHA1(hash),
+		Short:   r.shortenObjectHash(hash),
 		Time:    time.Unix(t, 0).UTC(),
 		Version: hash,
 	}
@@ -641,7 +694,21 @@ func (r *gitRepo) statLocal(ctx context.Context, version, rev string) (*RevInfo,
 			}
 		}
 	}
-	sort.Strings(info.Tags)
+
+	// Git 2.47.1 does not send the tags during shallow clone anymore
+	// (perhaps the exact version that changed behavior is an earlier one),
+	// so we have to also add tags from the refs list we fetched with ls-remote.
+	if refs, err := r.loadRefs(ctx); err == nil {
+		for ref, h := range refs {
+			if h == hash {
+				if tag, found := strings.CutPrefix(ref, "refs/tags/"); found {
+					info.Tags = append(info.Tags, tag)
+				}
+			}
+		}
+	}
+	slices.Sort(info.Tags)
+	info.Tags = slices.Compact(info.Tags)
 
 	// Used hash as info.Version above.
 	// Use caller's suggested version if it appears in the tag list
@@ -738,6 +805,9 @@ func (r *gitRepo) RecentTag(ctx context.Context, rev, prefix string, allowed fun
 		return "", nil
 	}
 
+	if r.local { // at this point, we have determined that we need to fetch rev, fail early if local only mode.
+		return "", fmt.Errorf("revision does not exist locally: %s", rev)
+	}
 	// There are plausible tags, but we don't know if rev is a descendent of any of them.
 	// Fetch the history to find out.
 
@@ -797,6 +867,10 @@ func (r *gitRepo) DescendsFrom(ctx context.Context, rev, tag string) (bool, erro
 	// that here.
 	if _, err = r.stat(ctx, rev); err != nil {
 		return false, err
+	}
+
+	if r.local { // at this point, we have determined that we need to fetch rev, fail early if local only mode.
+		return false, fmt.Errorf("revision does not exist locally: %s", rev)
 	}
 
 	// Now fetch history so that git can search for a path.

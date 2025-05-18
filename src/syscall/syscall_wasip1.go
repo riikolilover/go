@@ -223,6 +223,7 @@ const (
 	O_EXCL      = 0200
 	O_SYNC      = 010000
 	O_DIRECTORY = 020000
+	O_NOFOLLOW  = 0400
 
 	O_CLOEXEC = 0
 )
@@ -382,7 +383,7 @@ func Getppid() int {
 
 func Gettimeofday(tv *Timeval) error {
 	var time timestamp
-	if errno := clock_time_get(clockRealtime, 1e3, unsafe.Pointer(&time)); errno != 0 {
+	if errno := clock_time_get(clockRealtime, 1e3, &time); errno != 0 {
 		return errno
 	}
 	tv.setTimestamp(time)
@@ -464,7 +465,7 @@ const (
 
 //go:wasmimport wasi_snapshot_preview1 clock_time_get
 //go:noescape
-func clock_time_get(id clockid, precision timestamp, time unsafe.Pointer) Errno
+func clock_time_get(id clockid, precision timestamp, time *timestamp) Errno
 
 func SetNonblock(fd int, nonblocking bool) error {
 	flags, err := fd_fdstat_get_flags(fd)

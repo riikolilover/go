@@ -10,7 +10,7 @@ import (
 	"flag"
 	"fmt"
 	"go/token"
-	"internal/abi"
+	"internal/asan"
 	"internal/goarch"
 	"internal/goexperiment"
 	"internal/testenv"
@@ -1134,13 +1134,15 @@ var deepEqualTests = []DeepEqualTest{
 }
 
 func TestDeepEqual(t *testing.T) {
-	for _, test := range deepEqualTests {
-		if test.b == (self{}) {
-			test.b = test.a
-		}
-		if r := DeepEqual(test.a, test.b); r != test.eq {
-			t.Errorf("DeepEqual(%#v, %#v) = %v, want %v", test.a, test.b, r, test.eq)
-		}
+	for i, test := range deepEqualTests {
+		t.Run(fmt.Sprint(i), func(t *testing.T) {
+			if test.b == (self{}) {
+				test.b = test.a
+			}
+			if r := DeepEqual(test.a, test.b); r != test.eq {
+				t.Errorf("DeepEqual(%#v, %#v) = %v, want %v", test.a, test.b, r, test.eq)
+			}
+		})
 	}
 }
 
@@ -1273,6 +1275,14 @@ var deepEqualPerfTests = []struct {
 }
 
 func TestDeepEqualAllocs(t *testing.T) {
+	// TODO(prattmic): maps on stack
+	if goexperiment.SwissMap {
+		t.Skipf("Maps on stack not yet implemented")
+	}
+	if asan.Enabled {
+		t.Skip("test allocates more with -asan; see #70079")
+	}
+
 	for _, tt := range deepEqualPerfTests {
 		t.Run(ValueOf(tt.x).Type().String(), func(t *testing.T) {
 			got := testing.AllocsPerRun(100, func() {
@@ -2230,18 +2240,18 @@ func TestCallReturnsEmpty(t *testing.T) {
 	// Issue 21717: past-the-end pointer write in Call with
 	// nonzero-sized frame and zero-sized return value.
 	runtime.GC()
-	var finalized uint32
+	var cleanedUp atomic.Uint32
 	f := func() (emptyStruct, *[2]int64) {
-		i := new([2]int64) // big enough to not be tinyalloc'd, so finalizer always runs when i dies
-		runtime.SetFinalizer(i, func(*[2]int64) { atomic.StoreUint32(&finalized, 1) })
+		i := new([2]int64) // big enough to not be tinyalloc'd, so cleanup always runs when i dies
+		runtime.AddCleanup(i, func(cu *atomic.Uint32) { cu.Store(uint32(1)) }, &cleanedUp)
 		return emptyStruct{}, i
 	}
-	v := ValueOf(f).Call(nil)[0] // out[0] should not alias out[1]'s memory, so the finalizer should run.
+	v := ValueOf(f).Call(nil)[0] // out[0] should not alias out[1]'s memory, so the cleanup should run.
 	timeout := time.After(5 * time.Second)
-	for atomic.LoadUint32(&finalized) == 0 {
+	for cleanedUp.Load() == 0 {
 		select {
 		case <-timeout:
-			t.Fatal("finalizer did not run")
+			t.Fatal("cleanup did not run")
 		default:
 		}
 		runtime.Gosched()
@@ -6299,6 +6309,32 @@ func TestMapOfGCKeys(t *testing.T) {
 	}
 }
 
+// Test assignment and access to a map with keys larger than word size.
+func TestMapOfGCBigKey(t *testing.T) {
+	type KV struct {
+		i int64
+		j int64
+	}
+
+	kvTyp := TypeFor[KV]()
+	mt := MapOf(kvTyp, kvTyp)
+
+	const n = 100
+	m := MakeMap(mt)
+	for i := 0; i < n; i++ {
+		kv := KV{int64(i), int64(i + 1)}
+		m.SetMapIndex(ValueOf(kv), ValueOf(kv))
+	}
+
+	for i := 0; i < n; i++ {
+		kv := KV{int64(i), int64(i + 1)}
+		elem := m.MapIndex(ValueOf(kv)).Interface().(KV)
+		if elem != kv {
+			t.Errorf("lost m[%v] = %v, want %v", kv, elem, kv)
+		}
+	}
+}
+
 func TestMapOfGCValues(t *testing.T) {
 	type T *uintptr
 	tt := TypeOf(T(nil))
@@ -6831,7 +6867,7 @@ func TestInvalid(t *testing.T) {
 }
 
 // Issue 8917.
-func TestLargeGCProg(t *testing.T) {
+func TestLarge(t *testing.T) {
 	fv := ValueOf(func([256]*byte) {})
 	fv.Call([]Value{ValueOf([256]*byte{})})
 }
@@ -7171,60 +7207,61 @@ func verifyGCBitsSlice(t *testing.T, typ Type, cap int, bits []byte) {
 	t.Errorf("line %d: heapBits incorrect for make(%v, 0, %v)\nhave %v\nwant %v", line, typ, cap, heapBits, bits)
 }
 
-func TestGCBits(t *testing.T) {
-	verifyGCBits(t, TypeOf((*byte)(nil)), []byte{1})
+// Building blocks for types seen by the compiler (like [2]Xscalar).
+// The compiler will create the type structures for the derived types,
+// including their GC metadata.
+type Xscalar struct{ x uintptr }
+type Xptr struct{ x *byte }
+type Xptrscalar struct {
+	*byte
+	uintptr
+}
+type Xscalarptr struct {
+	uintptr
+	*byte
+}
+type Xbigptrscalar struct {
+	_ [100]*byte
+	_ [100]uintptr
+}
 
-	// Building blocks for types seen by the compiler (like [2]Xscalar).
-	// The compiler will create the type structures for the derived types,
-	// including their GC metadata.
-	type Xscalar struct{ x uintptr }
-	type Xptr struct{ x *byte }
-	type Xptrscalar struct {
+var Tscalar, Tint64, Tptr, Tscalarptr, Tptrscalar, Tbigptrscalar Type
+
+func init() {
+	// Building blocks for types constructed by reflect.
+	// This code is in a separate block so that code below
+	// cannot accidentally refer to these.
+	// The compiler must NOT see types derived from these
+	// (for example, [2]Scalar must NOT appear in the program),
+	// or else reflect will use it instead of having to construct one.
+	// The goal is to test the construction.
+	type Scalar struct{ x uintptr }
+	type Ptr struct{ x *byte }
+	type Ptrscalar struct {
 		*byte
 		uintptr
 	}
-	type Xscalarptr struct {
+	type Scalarptr struct {
 		uintptr
 		*byte
 	}
-	type Xbigptrscalar struct {
+	type Bigptrscalar struct {
 		_ [100]*byte
 		_ [100]uintptr
 	}
+	type Int64 int64
+	Tscalar = TypeOf(Scalar{})
+	Tint64 = TypeOf(Int64(0))
+	Tptr = TypeOf(Ptr{})
+	Tscalarptr = TypeOf(Scalarptr{})
+	Tptrscalar = TypeOf(Ptrscalar{})
+	Tbigptrscalar = TypeOf(Bigptrscalar{})
+}
 
-	var Tscalar, Tint64, Tptr, Tscalarptr, Tptrscalar, Tbigptrscalar Type
-	{
-		// Building blocks for types constructed by reflect.
-		// This code is in a separate block so that code below
-		// cannot accidentally refer to these.
-		// The compiler must NOT see types derived from these
-		// (for example, [2]Scalar must NOT appear in the program),
-		// or else reflect will use it instead of having to construct one.
-		// The goal is to test the construction.
-		type Scalar struct{ x uintptr }
-		type Ptr struct{ x *byte }
-		type Ptrscalar struct {
-			*byte
-			uintptr
-		}
-		type Scalarptr struct {
-			uintptr
-			*byte
-		}
-		type Bigptrscalar struct {
-			_ [100]*byte
-			_ [100]uintptr
-		}
-		type Int64 int64
-		Tscalar = TypeOf(Scalar{})
-		Tint64 = TypeOf(Int64(0))
-		Tptr = TypeOf(Ptr{})
-		Tscalarptr = TypeOf(Scalarptr{})
-		Tptrscalar = TypeOf(Ptrscalar{})
-		Tbigptrscalar = TypeOf(Bigptrscalar{})
-	}
+var empty = []byte{}
 
-	empty := []byte{}
+func TestGCBits(t *testing.T) {
+	verifyGCBits(t, TypeOf((*byte)(nil)), []byte{1})
 
 	verifyGCBits(t, TypeOf(Xscalar{}), empty)
 	verifyGCBits(t, Tscalar, empty)
@@ -7304,95 +7341,7 @@ func TestGCBits(t *testing.T) {
 	verifyGCBits(t, TypeOf(([][10000]Xscalar)(nil)), lit(1))
 	verifyGCBits(t, SliceOf(ArrayOf(10000, Tscalar)), lit(1))
 
-	if goexperiment.SwissMap {
-		const bucketCount = abi.SwissMapBucketCount
-
-		hdr := make([]byte, bucketCount/goarch.PtrSize)
-
-		verifyMapBucket := func(t *testing.T, k, e Type, m any, want []byte) {
-			verifyGCBits(t, MapBucketOf(k, e), want)
-			verifyGCBits(t, CachedBucketOf(TypeOf(m)), want)
-		}
-		verifyMapBucket(t,
-			Tscalar, Tptr,
-			map[Xscalar]Xptr(nil),
-			join(hdr, rep(bucketCount, lit(0)), rep(bucketCount, lit(1)), lit(1)))
-		verifyMapBucket(t,
-			Tscalarptr, Tptr,
-			map[Xscalarptr]Xptr(nil),
-			join(hdr, rep(bucketCount, lit(0, 1)), rep(bucketCount, lit(1)), lit(1)))
-		verifyMapBucket(t, Tint64, Tptr,
-			map[int64]Xptr(nil),
-			join(hdr, rep(bucketCount, rep(8/goarch.PtrSize, lit(0))), rep(bucketCount, lit(1)), lit(1)))
-		verifyMapBucket(t,
-			Tscalar, Tscalar,
-			map[Xscalar]Xscalar(nil),
-			empty)
-		verifyMapBucket(t,
-			ArrayOf(2, Tscalarptr), ArrayOf(3, Tptrscalar),
-			map[[2]Xscalarptr][3]Xptrscalar(nil),
-			join(hdr, rep(bucketCount*2, lit(0, 1)), rep(bucketCount*3, lit(1, 0)), lit(1)))
-		verifyMapBucket(t,
-			ArrayOf(64/goarch.PtrSize, Tscalarptr), ArrayOf(64/goarch.PtrSize, Tptrscalar),
-			map[[64 / goarch.PtrSize]Xscalarptr][64 / goarch.PtrSize]Xptrscalar(nil),
-			join(hdr, rep(bucketCount*64/goarch.PtrSize, lit(0, 1)), rep(bucketCount*64/goarch.PtrSize, lit(1, 0)), lit(1)))
-		verifyMapBucket(t,
-			ArrayOf(64/goarch.PtrSize+1, Tscalarptr), ArrayOf(64/goarch.PtrSize, Tptrscalar),
-			map[[64/goarch.PtrSize + 1]Xscalarptr][64 / goarch.PtrSize]Xptrscalar(nil),
-			join(hdr, rep(bucketCount, lit(1)), rep(bucketCount*64/goarch.PtrSize, lit(1, 0)), lit(1)))
-		verifyMapBucket(t,
-			ArrayOf(64/goarch.PtrSize, Tscalarptr), ArrayOf(64/goarch.PtrSize+1, Tptrscalar),
-			map[[64 / goarch.PtrSize]Xscalarptr][64/goarch.PtrSize + 1]Xptrscalar(nil),
-			join(hdr, rep(bucketCount*64/goarch.PtrSize, lit(0, 1)), rep(bucketCount, lit(1)), lit(1)))
-		verifyMapBucket(t,
-			ArrayOf(64/goarch.PtrSize+1, Tscalarptr), ArrayOf(64/goarch.PtrSize+1, Tptrscalar),
-			map[[64/goarch.PtrSize + 1]Xscalarptr][64/goarch.PtrSize + 1]Xptrscalar(nil),
-			join(hdr, rep(bucketCount, lit(1)), rep(bucketCount, lit(1)), lit(1)))
-	} else {
-		const bucketCount = abi.OldMapBucketCount
-
-		hdr := make([]byte, bucketCount/goarch.PtrSize)
-
-		verifyMapBucket := func(t *testing.T, k, e Type, m any, want []byte) {
-			verifyGCBits(t, MapBucketOf(k, e), want)
-			verifyGCBits(t, CachedBucketOf(TypeOf(m)), want)
-		}
-		verifyMapBucket(t,
-			Tscalar, Tptr,
-			map[Xscalar]Xptr(nil),
-			join(hdr, rep(bucketCount, lit(0)), rep(bucketCount, lit(1)), lit(1)))
-		verifyMapBucket(t,
-			Tscalarptr, Tptr,
-			map[Xscalarptr]Xptr(nil),
-			join(hdr, rep(bucketCount, lit(0, 1)), rep(bucketCount, lit(1)), lit(1)))
-		verifyMapBucket(t, Tint64, Tptr,
-			map[int64]Xptr(nil),
-			join(hdr, rep(bucketCount, rep(8/goarch.PtrSize, lit(0))), rep(bucketCount, lit(1)), lit(1)))
-		verifyMapBucket(t,
-			Tscalar, Tscalar,
-			map[Xscalar]Xscalar(nil),
-			empty)
-		verifyMapBucket(t,
-			ArrayOf(2, Tscalarptr), ArrayOf(3, Tptrscalar),
-			map[[2]Xscalarptr][3]Xptrscalar(nil),
-			join(hdr, rep(bucketCount*2, lit(0, 1)), rep(bucketCount*3, lit(1, 0)), lit(1)))
-		verifyMapBucket(t,
-			ArrayOf(64/goarch.PtrSize, Tscalarptr), ArrayOf(64/goarch.PtrSize, Tptrscalar),
-			map[[64 / goarch.PtrSize]Xscalarptr][64 / goarch.PtrSize]Xptrscalar(nil),
-			join(hdr, rep(bucketCount*64/goarch.PtrSize, lit(0, 1)), rep(bucketCount*64/goarch.PtrSize, lit(1, 0)), lit(1)))
-		verifyMapBucket(t,
-			ArrayOf(64/goarch.PtrSize+1, Tscalarptr), ArrayOf(64/goarch.PtrSize, Tptrscalar),
-			map[[64/goarch.PtrSize + 1]Xscalarptr][64 / goarch.PtrSize]Xptrscalar(nil),
-			join(hdr, rep(bucketCount, lit(1)), rep(bucketCount*64/goarch.PtrSize, lit(1, 0)), lit(1)))
-		verifyMapBucket(t,
-			ArrayOf(64/goarch.PtrSize, Tscalarptr), ArrayOf(64/goarch.PtrSize+1, Tptrscalar),
-			map[[64 / goarch.PtrSize]Xscalarptr][64/goarch.PtrSize + 1]Xptrscalar(nil),
-			join(hdr, rep(bucketCount*64/goarch.PtrSize, lit(0, 1)), rep(bucketCount, lit(1)), lit(1)))
-		verifyMapBucket(t,
-			ArrayOf(64/goarch.PtrSize+1, Tscalarptr), ArrayOf(64/goarch.PtrSize+1, Tptrscalar),
-			map[[64/goarch.PtrSize + 1]Xscalarptr][64/goarch.PtrSize + 1]Xptrscalar(nil),
-			join(hdr, rep(bucketCount, lit(1)), rep(bucketCount, lit(1)), lit(1)))
-	}
+	testGCBitsMap(t)
 }
 
 func rep(n int, b []byte) []byte { return bytes.Repeat(b, n) }
@@ -7434,6 +7383,9 @@ func TestPtrToMethods(t *testing.T) {
 }
 
 func TestMapAlloc(t *testing.T) {
+	if asan.Enabled {
+		t.Skip("test allocates more with -asan; see #70079")
+	}
 	m := ValueOf(make(map[int]int, 10))
 	k := ValueOf(5)
 	v := ValueOf(7)
@@ -7464,6 +7416,9 @@ func TestMapAlloc(t *testing.T) {
 }
 
 func TestChanAlloc(t *testing.T) {
+	if asan.Enabled {
+		t.Skip("test allocates more with -asan; see #70079")
+	}
 	// Note: for a chan int, the return Value must be allocated, so we
 	// use a chan *int instead.
 	c := ValueOf(make(chan *int, 1))
@@ -7826,11 +7781,14 @@ func TestMapIterReset(t *testing.T) {
 	}
 
 	// Reset should not allocate.
+	//
+	// Except with -asan, where there are additional allocations.
+	// See #70079.
 	n := int(testing.AllocsPerRun(10, func() {
 		iter.Reset(ValueOf(m2))
 		iter.Reset(Value{})
 	}))
-	if n > 0 {
+	if !asan.Enabled && n > 0 {
 		t.Errorf("MapIter.Reset allocated %d times", n)
 	}
 }

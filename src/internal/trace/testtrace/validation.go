@@ -14,14 +14,14 @@ import (
 
 // Validator is a type used for validating a stream of trace.Events.
 type Validator struct {
-	lastTs   trace.Time
-	gs       map[trace.GoID]*goState
-	ps       map[trace.ProcID]*procState
-	ms       map[trace.ThreadID]*schedContext
-	ranges   map[trace.ResourceID][]string
-	tasks    map[trace.TaskID]string
-	seenSync bool
-	Go121    bool
+	lastTs trace.Time
+	gs     map[trace.GoID]*goState
+	ps     map[trace.ProcID]*procState
+	ms     map[trace.ThreadID]*schedContext
+	ranges map[trace.ResourceID][]string
+	tasks  map[trace.TaskID]string
+	nSync  int
+	Go121  bool
 }
 
 type schedContext struct {
@@ -60,7 +60,7 @@ func (v *Validator) Event(ev trace.Event) error {
 	// Validate timestamp order.
 	if v.lastTs != 0 {
 		if ev.Time() <= v.lastTs {
-			e.Errorf("timestamp out-of-order for %+v", ev)
+			e.Errorf("timestamp out-of-order (want > %v) for %+v", v.lastTs, ev)
 		} else {
 			v.lastTs = ev.Time()
 		}
@@ -73,8 +73,11 @@ func (v *Validator) Event(ev trace.Event) error {
 
 	switch ev.Kind() {
 	case trace.EventSync:
-		// Just record that we've seen a Sync at some point.
-		v.seenSync = true
+		s := ev.Sync()
+		if s.N != v.nSync+1 {
+			e.Errorf("sync count is not sequential: expected %d, got %d", v.nSync+1, s.N)
+		}
+		v.nSync = s.N
 	case trace.EventMetric:
 		m := ev.Metric()
 		if !strings.Contains(m.Name, ":") {
@@ -88,7 +91,7 @@ func (v *Validator) Event(ev trace.Event) error {
 		switch m.Value.Kind() {
 		case trace.ValueUint64:
 			// Just make sure it doesn't panic.
-			_ = m.Value.Uint64()
+			_ = m.Value.ToUint64()
 		}
 	case trace.EventLabel:
 		l := ev.Label()
@@ -140,7 +143,7 @@ func (v *Validator) Event(ev trace.Event) error {
 			if new == trace.GoUndetermined {
 				e.Errorf("transition to undetermined state for goroutine %d", id)
 			}
-			if v.seenSync && old == trace.GoUndetermined {
+			if v.nSync > 1 && old == trace.GoUndetermined {
 				e.Errorf("undetermined goroutine %d after first global sync", id)
 			}
 			if new == trace.GoNotExist && v.hasAnyRange(trace.MakeResourceID(id)) {
@@ -193,7 +196,7 @@ func (v *Validator) Event(ev trace.Event) error {
 			if new == trace.ProcUndetermined {
 				e.Errorf("transition to undetermined state for proc %d", id)
 			}
-			if v.seenSync && old == trace.ProcUndetermined {
+			if v.nSync > 1 && old == trace.ProcUndetermined {
 				e.Errorf("undetermined proc %d after first global sync", id)
 			}
 			if new == trace.ProcNotExist && v.hasAnyRange(trace.MakeResourceID(id)) {
@@ -350,20 +353,17 @@ func (v *Validator) getOrCreateThread(e *errAccumulator, ev trace.Event, m trace
 
 func checkStack(e *errAccumulator, stk trace.Stack) {
 	// Check for non-empty values, but we also check for crashes due to incorrect validation.
-	i := 0
-	stk.Frames(func(f trace.StackFrame) bool {
+	for i, f := range slices.Collect(stk.Frames()) {
 		if i == 0 {
 			// Allow for one fully zero stack.
 			//
 			// TODO(mknyszek): Investigate why that happens.
-			return true
+			continue
 		}
 		if f.Func == "" || f.File == "" || f.PC == 0 || f.Line == 0 {
 			e.Errorf("invalid stack frame %#v: missing information", f)
 		}
-		i++
-		return true
-	})
+	}
 }
 
 type errAccumulator struct {

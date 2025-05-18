@@ -9,6 +9,7 @@ import (
 	"go/ast"
 	"go/token"
 	"io/fs"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -632,6 +633,7 @@ var parseDepthTests = []struct {
 	{name: "go", format: "package main; func main() { «go func() { «» }()» }", parseMultiplier: 2, scope: true},                      // Parser nodes: GoStmt, FuncLit
 	{name: "defer", format: "package main; func main() { «defer func() { «» }()» }", parseMultiplier: 2, scope: true},                // Parser nodes: DeferStmt, FuncLit
 	{name: "select", format: "package main; func main() { «select { default: «» }» }", scope: true},
+	{name: "block", format: "package main; func main() { «{«»}» }", scope: true},
 }
 
 // split splits pre«mid»post into pre, mid, post.
@@ -836,5 +838,61 @@ func TestParseTypeParamsAsParenExpr(t *testing.T) {
 	_, ok := typeParam.(*ast.ParenExpr)
 	if !ok {
 		t.Fatalf("typeParam is a %T; want: *ast.ParenExpr", typeParam)
+	}
+}
+
+// TestEmptyFileHasValidStartEnd is a regression test for #70162.
+func TestEmptyFileHasValidStartEnd(t *testing.T) {
+	for _, test := range []struct {
+		src  string
+		want string // "Pos() FileStart FileEnd"
+	}{
+		{src: "", want: "0 1 1"},
+		{src: "package ", want: "0 1 9"},
+		{src: "package p", want: "1 1 10"},
+		{src: "type T int", want: "0 1 11"},
+	} {
+		fset := token.NewFileSet()
+		f, _ := ParseFile(fset, "a.go", test.src, 0)
+		got := fmt.Sprintf("%d %d %d", f.Pos(), f.FileStart, f.FileEnd)
+		if got != test.want {
+			t.Fatalf("src = %q: got %s, want %s", test.src, got, test.want)
+		}
+	}
+}
+
+func TestCommentGroupWithLineDirective(t *testing.T) {
+	const src = `package main
+func test() {
+//line a:15:1
+	//
+}
+`
+	fset := token.NewFileSet()
+	f, err := ParseFile(fset, "test.go", src, ParseComments|SkipObjectResolution)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	wantCommentGroups := []*ast.CommentGroup{
+		{
+			List: []*ast.Comment{
+				{
+					Slash: token.Pos(28),
+					Text:  "//line a:15:1",
+				},
+				{
+					Slash: token.Pos(43),
+					Text:  "//",
+				},
+			},
+		},
+	}
+
+	if !reflect.DeepEqual(f.Comments, wantCommentGroups) {
+		var got, want strings.Builder
+		ast.Fprint(&got, fset, f.Comments, nil)
+		ast.Fprint(&want, fset, wantCommentGroups, nil)
+		t.Fatalf("unexpected f.Comments got:\n%v\nwant:\n%v", got.String(), want.String())
 	}
 }

@@ -9,6 +9,7 @@ package runtime
 import (
 	"internal/abi"
 	"internal/goarch"
+	"internal/goexperiment"
 	"internal/runtime/atomic"
 	"internal/runtime/sys"
 	"unsafe"
@@ -17,6 +18,7 @@ import (
 const (
 	fixedRootFinalizers = iota
 	fixedRootFreeGStacks
+	fixedRootCleanups
 	fixedRootCount
 
 	// rootBlockBytes is the number of bytes to scan per data or
@@ -89,9 +91,9 @@ func gcMarkRootPrepare() {
 	//
 	// Break up the work into arenas, and further into chunks.
 	//
-	// Snapshot allArenas as markArenas. This snapshot is safe because allArenas
+	// Snapshot heapArenas as markArenas. This snapshot is safe because heapArenas
 	// is append-only.
-	mheap_.markArenas = mheap_.allArenas[:len(mheap_.allArenas):len(mheap_.allArenas)]
+	mheap_.markArenas = mheap_.heapArenas[:len(mheap_.heapArenas):len(mheap_.heapArenas)]
 	work.nSpanRoots = len(mheap_.markArenas) * (pagesPerArena / pagesPerSpanRoot)
 
 	// Scan stacks.
@@ -185,6 +187,14 @@ func markroot(gcw *gcWork, i uint32, flushBgCredit bool) int64 {
 		// Switch to the system stack so we can call
 		// stackfree.
 		systemstack(markrootFreeGStacks)
+
+	case i == fixedRootCleanups:
+		for cb := (*cleanupBlock)(gcCleanups.all.Load()); cb != nil; cb = cb.alllink {
+			// N.B. This only needs to synchronize with cleanup execution, which only resets these blocks.
+			// All cleanup queueing happens during sweep.
+			n := uintptr(atomic.Load(&cb.n))
+			scanblock(uintptr(unsafe.Pointer(&cb.cleanups[0])), n*goarch.PtrSize, &cleanupBlockPtrMask[0], gcw, nil)
+		}
 
 	case work.baseSpans <= i && i < work.baseStacks:
 		// mark mspan.specials
@@ -299,15 +309,15 @@ func markrootFreeGStacks() {
 	}
 
 	// Free stacks.
-	q := gQueue{list.head, list.head}
+	var tail *g
 	for gp := list.head.ptr(); gp != nil; gp = gp.schedlink.ptr() {
+		tail = gp
 		stackfree(gp.stack)
 		gp.stack.lo = 0
 		gp.stack.hi = 0
-		// Manipulate the queue directly since the Gs are
-		// already all linked the right way.
-		q.tail.set(gp)
 	}
+
+	q := gQueue{list.head, tail.guintptr(), list.size}
 
 	// Put Gs back on the free list.
 	lock(&sched.gFree.lock)
@@ -401,6 +411,10 @@ func markrootSpans(gcw *gcWork, shard int) {
 					// The special itself is a root.
 					spw := (*specialWeakHandle)(unsafe.Pointer(sp))
 					scanblock(uintptr(unsafe.Pointer(&spw.handle)), goarch.PtrSize, &oneptrmask[0], gcw, nil)
+				case _KindSpecialCleanup:
+					spc := (*specialCleanup)(unsafe.Pointer(sp))
+					// The special itself is a root.
+					scanblock(uintptr(unsafe.Pointer(&spc.fn)), goarch.PtrSize, &oneptrmask[0], gcw, nil)
 				}
 			}
 			unlock(&s.speciallock)
@@ -420,6 +434,17 @@ func gcAssistAlloc(gp *g) {
 	}
 	if mp := getg().m; mp.locks > 0 || mp.preemptoff != "" {
 		return
+	}
+
+	if gp := getg(); gp.bubble != nil {
+		// Disassociate the G from its synctest bubble while allocating.
+		// This is less elegant than incrementing the group's active count,
+		// but avoids any contamination between GC assist and synctest.
+		bubble := gp.bubble
+		gp.bubble = nil
+		defer func() {
+			gp.bubble = bubble
+		}()
 	}
 
 	// This extremely verbose boolean indicates whether we've
@@ -945,31 +970,12 @@ func scanstack(gp *g, gcw *gcWork) int64 {
 			println()
 			printunlock()
 		}
-		gcdata := r.gcdata()
-		var s *mspan
-		if r.useGCProg() {
-			// This path is pretty unlikely, an object large enough
-			// to have a GC program allocated on the stack.
-			// We need some space to unpack the program into a straight
-			// bitmask, which we allocate/free here.
-			// TODO: it would be nice if there were a way to run a GC
-			// program without having to store all its bits. We'd have
-			// to change from a Lempel-Ziv style program to something else.
-			// Or we can forbid putting objects on stacks if they require
-			// a gc program (see issue 27447).
-			s = materializeGCProg(r.ptrdata(), gcdata)
-			gcdata = (*byte)(unsafe.Pointer(s.startAddr))
-		}
-
+		ptrBytes, gcData := r.gcdata()
 		b := state.stack.lo + uintptr(obj.off)
 		if conservative {
-			scanConservative(b, r.ptrdata(), gcdata, gcw, &state)
+			scanConservative(b, ptrBytes, gcData, gcw, &state)
 		} else {
-			scanblock(b, r.ptrdata(), gcdata, gcw, &state)
-		}
-
-		if s != nil {
-			dematerializeGCProg(s)
+			scanblock(b, ptrBytes, gcData, gcw, &state)
 		}
 	}
 
@@ -1189,6 +1195,14 @@ func gcDrain(gcw *gcWork, flags gcDrainFlags) {
 			if check != nil && check() {
 				goto done
 			}
+
+			// Spin up a new worker if requested.
+			if goexperiment.GreenTeaGC && gcw.mayNeedWorker {
+				gcw.mayNeedWorker = false
+				if gcphase == _GCmark {
+					gcController.enlistWorker()
+				}
+			}
 		}
 	}
 
@@ -1212,22 +1226,38 @@ func gcDrain(gcw *gcWork, flags gcDrainFlags) {
 			gcw.balance()
 		}
 
-		b := gcw.tryGetFast()
-		if b == 0 {
-			b = gcw.tryGet()
-			if b == 0 {
-				// Flush the write barrier
-				// buffer; this may create
-				// more work.
-				wbBufFlush()
-				b = gcw.tryGet()
+		// See mgcwork.go for the rationale behind the order in which we check these queues.
+		var b uintptr
+		var s objptr
+		if b = gcw.tryGetObjFast(); b == 0 {
+			if s = gcw.tryGetSpan(false); s == 0 {
+				if b = gcw.tryGetObj(); b == 0 {
+					// Flush the write barrier
+					// buffer; this may create
+					// more work.
+					wbBufFlush()
+					if b = gcw.tryGetObj(); b == 0 {
+						s = gcw.tryGetSpan(true)
+					}
+				}
 			}
 		}
-		if b == 0 {
+		if b != 0 {
+			scanobject(b, gcw)
+		} else if s != 0 {
+			scanSpan(s, gcw)
+		} else {
 			// Unable to get work.
 			break
 		}
-		scanobject(b, gcw)
+
+		// Spin up a new worker if requested.
+		if goexperiment.GreenTeaGC && gcw.mayNeedWorker {
+			gcw.mayNeedWorker = false
+			if gcphase == _GCmark {
+				gcController.enlistWorker()
+			}
+		}
 
 		// Flush background scan work credit to the global
 		// account if we've accumulated enough locally so
@@ -1292,37 +1322,52 @@ func gcDrainN(gcw *gcWork, scanWork int64) int64 {
 			gcw.balance()
 		}
 
-		b := gcw.tryGetFast()
-		if b == 0 {
-			b = gcw.tryGet()
-			if b == 0 {
-				// Flush the write barrier buffer;
-				// this may create more work.
-				wbBufFlush()
-				b = gcw.tryGet()
-			}
-		}
-
-		if b == 0 {
-			// Try to do a root job.
-			if work.markrootNext < work.markrootJobs {
-				job := atomic.Xadd(&work.markrootNext, +1) - 1
-				if job < work.markrootJobs {
-					workFlushed += markroot(gcw, job, false)
-					continue
+		// See mgcwork.go for the rationale behind the order in which we check these queues.
+		var b uintptr
+		var s objptr
+		if b = gcw.tryGetObjFast(); b == 0 {
+			if s = gcw.tryGetSpan(false); s == 0 {
+				if b = gcw.tryGetObj(); b == 0 {
+					// Flush the write barrier
+					// buffer; this may create
+					// more work.
+					wbBufFlush()
+					if b = gcw.tryGetObj(); b == 0 {
+						// Try to do a root job.
+						if work.markrootNext < work.markrootJobs {
+							job := atomic.Xadd(&work.markrootNext, +1) - 1
+							if job < work.markrootJobs {
+								workFlushed += markroot(gcw, job, false)
+								continue
+							}
+						}
+						s = gcw.tryGetSpan(true)
+					}
 				}
 			}
-			// No heap or root jobs.
+		}
+		if b != 0 {
+			scanobject(b, gcw)
+		} else if s != 0 {
+			scanSpan(s, gcw)
+		} else {
+			// Unable to get work.
 			break
 		}
-
-		scanobject(b, gcw)
 
 		// Flush background scan work credit.
 		if gcw.heapScanWork >= gcCreditSlack {
 			gcController.heapScanWork.Add(gcw.heapScanWork)
 			workFlushed += gcw.heapScanWork
 			gcw.heapScanWork = 0
+		}
+
+		// Spin up a new worker if requested.
+		if goexperiment.GreenTeaGC && gcw.mayNeedWorker {
+			gcw.mayNeedWorker = false
+			if gcphase == _GCmark {
+				gcController.enlistWorker()
+			}
 		}
 	}
 
@@ -1361,10 +1406,14 @@ func scanblock(b0, n0 uintptr, ptrmask *uint8, gcw *gcWork, stk *stackScanState)
 				// Same work as in scanobject; see comments there.
 				p := *(*uintptr)(unsafe.Pointer(b + i))
 				if p != 0 {
-					if obj, span, objIndex := findObject(p, b, i); obj != 0 {
-						greyobject(obj, b, i, span, gcw, objIndex)
-					} else if stk != nil && p >= stk.stack.lo && p < stk.stack.hi {
+					if stk != nil && p >= stk.stack.lo && p < stk.stack.hi {
 						stk.putPtr(p, false)
+					} else {
+						if !tryDeferToSpanScan(p, gcw) {
+							if obj, span, objIndex := findObject(p, b, i); obj != 0 {
+								greyobject(obj, b, i, span, gcw, objIndex)
+							}
+						}
 					}
 				}
 			}
@@ -1414,8 +1463,8 @@ func scanobject(b uintptr, gcw *gcWork) {
 			// so we'll drop out immediately when we go to
 			// scan those.
 			for oblet := b + maxObletBytes; oblet < s.base()+s.elemsize; oblet += maxObletBytes {
-				if !gcw.putFast(oblet) {
-					gcw.put(oblet)
+				if !gcw.putObjFast(oblet) {
+					gcw.putObj(oblet)
 				}
 			}
 		}
@@ -1461,13 +1510,18 @@ func scanobject(b uintptr, gcw *gcWork) {
 			// heap. In this case, we know the object was
 			// just allocated and hence will be marked by
 			// allocation itself.
-			if obj, span, objIndex := findObject(obj, b, addr-b); obj != 0 {
-				greyobject(obj, b, addr-b, span, gcw, objIndex)
+			if !tryDeferToSpanScan(obj, gcw) {
+				if obj, span, objIndex := findObject(obj, b, addr-b); obj != 0 {
+					greyobject(obj, b, addr-b, span, gcw, objIndex)
+				}
 			}
 		}
 	}
 	gcw.bytesMarked += uint64(n)
 	gcw.heapScanWork += int64(scanSize)
+	if debug.gctrace > 1 {
+		gcw.stats[s.spanclass.sizeclass()].sparseObjsScanned++
+	}
 }
 
 // scanConservative scans block [b, b+n) conservatively, treating any
@@ -1561,7 +1615,9 @@ func scanConservative(b, n uintptr, ptrmask *uint8, gcw *gcWork, state *stackSca
 
 		// val points to an allocated object. Mark it.
 		obj := span.base() + idx*span.elemsize
-		greyobject(obj, b, i, span, gcw, idx)
+		if !tryDeferToSpanScan(obj, gcw) {
+			greyobject(obj, b, i, span, gcw, idx)
+		}
 	}
 }
 
@@ -1571,9 +1627,11 @@ func scanConservative(b, n uintptr, ptrmask *uint8, gcw *gcWork, state *stackSca
 //
 //go:nowritebarrier
 func shade(b uintptr) {
-	if obj, span, objIndex := findObject(b, 0, 0); obj != 0 {
-		gcw := &getg().m.p.ptr().gcw
-		greyobject(obj, 0, 0, span, gcw, objIndex)
+	gcw := &getg().m.p.ptr().gcw
+	if !tryDeferToSpanScan(b, gcw) {
+		if obj, span, objIndex := findObject(b, 0, 0); obj != 0 {
+			greyobject(obj, 0, 0, span, gcw, objIndex)
+		}
 	}
 }
 
@@ -1616,13 +1674,13 @@ func greyobject(obj, base, off uintptr, span *mspan, gcw *gcWork, objIndex uintp
 		if arena.pageMarks[pageIdx]&pageMask == 0 {
 			atomic.Or8(&arena.pageMarks[pageIdx], pageMask)
 		}
+	}
 
-		// If this is a noscan object, fast-track it to black
-		// instead of greying it.
-		if span.spanclass.noscan() {
-			gcw.bytesMarked += uint64(span.elemsize)
-			return
-		}
+	// If this is a noscan object, fast-track it to black
+	// instead of greying it.
+	if span.spanclass.noscan() {
+		gcw.bytesMarked += uint64(span.elemsize)
+		return
 	}
 
 	// We're adding obj to P's local workbuf, so it's likely
@@ -1631,8 +1689,8 @@ func greyobject(obj, base, off uintptr, span *mspan, gcw *gcWork, objIndex uintp
 	// some benefit on platforms with inclusive shared caches.
 	sys.Prefetch(obj)
 	// Queue the obj for scanning.
-	if !gcw.putFast(obj) {
-		gcw.put(obj)
+	if !gcw.putObjFast(obj) {
+		gcw.putObj(obj)
 	}
 }
 
@@ -1694,10 +1752,18 @@ func gcmarknewobject(span *mspan, obj uintptr) {
 	if useCheckmark { // The world should be stopped so this should not happen.
 		throw("gcmarknewobject called while doing checkmark")
 	}
+	if gcphase == _GCmarktermination {
+		// Check this here instead of on the hot path.
+		throw("mallocgc called with gcphase == _GCmarktermination")
+	}
 
 	// Mark object.
 	objIndex := span.objIndex(obj)
 	span.markBitsForIndex(objIndex).setMarked()
+	if goexperiment.GreenTeaGC && gcUsesSpanInlineMarkBits(span.elemsize) {
+		// No need to scan the new object.
+		span.scannedBitsForIndex(objIndex).setMarked()
+	}
 
 	// Mark span.
 	arena, pageIdx, pageMask := pageIndexOf(span.base())
@@ -1720,8 +1786,10 @@ func gcMarkTinyAllocs() {
 		if c == nil || c.tiny == 0 {
 			continue
 		}
-		_, span, objIndex := findObject(c.tiny, 0, 0)
 		gcw := &p.gcw
-		greyobject(c.tiny, 0, 0, span, gcw, objIndex)
+		if !tryDeferToSpanScan(c.tiny, gcw) {
+			_, span, objIndex := findObject(c.tiny, 0, 0)
+			greyobject(c.tiny, 0, 0, span, gcw, objIndex)
+		}
 	}
 }

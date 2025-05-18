@@ -16,6 +16,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -148,12 +149,11 @@ func TestTraceCPUProfile(t *testing.T) {
 				if hogRegion != nil && ev.Goroutine() == hogRegion.Goroutine() {
 					traceSamples++
 					var fns []string
-					ev.Stack().Frames(func(frame trace.StackFrame) bool {
+					for frame := range ev.Stack().Frames() {
 						if frame.Func != "runtime.goexit" {
 							fns = append(fns, fmt.Sprintf("%s:%d", frame.Func, frame.Line))
 						}
-						return true
-					})
+					}
 					stack := strings.Join(fns, "|")
 					traceStacks[stack]++
 				}
@@ -436,21 +436,15 @@ func TestTraceStacks(t *testing.T) {
 			}...)
 		}
 		stackMatches := func(stk trace.Stack, frames []frame) bool {
-			i := 0
-			match := true
-			stk.Frames(func(f trace.StackFrame) bool {
+			for i, f := range slices.Collect(stk.Frames()) {
 				if f.Func != frames[i].fn {
-					match = false
 					return false
 				}
 				if line := uint64(frames[i].line); line != 0 && line != f.Line {
-					match = false
 					return false
 				}
-				i++
-				return true
-			})
-			return match
+			}
+			return true
 		}
 		r, err := trace.NewReader(bytes.NewReader(tb))
 		if err != nil {
@@ -578,6 +572,11 @@ func testTraceProg(t *testing.T, progName string, extra func(t *testing.T, trace
 	// Check if we're on a builder.
 	onBuilder := testenv.Builder() != ""
 	onOldBuilder := !strings.Contains(testenv.Builder(), "gotip") && !strings.Contains(testenv.Builder(), "go1")
+
+	if progName == "cgo-callback.go" && onBuilder && !onOldBuilder &&
+		runtime.GOOS == "freebsd" && runtime.GOARCH == "amd64" && race.Enabled {
+		t.Skip("test fails on freebsd-amd64-race in LUCI; see go.dev/issue/71556")
+	}
 
 	testPath := filepath.Join("./testdata/testprog", progName)
 	testName := progName

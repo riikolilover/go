@@ -11,6 +11,7 @@ import (
 	"internal/goarch"
 	"internal/goos"
 	"internal/runtime/atomic"
+	"internal/runtime/gc"
 	"internal/runtime/sys"
 	"unsafe"
 )
@@ -39,6 +40,8 @@ var Atoi32 = atoi32
 var ParseByteCount = parseByteCount
 
 var Nanotime = nanotime
+var Cputicks = cputicks
+var CyclesPerSecond = pprof_cyclesPerSecond
 var NetpollBreak = netpollBreak
 var Usleep = usleep
 
@@ -94,9 +97,9 @@ func Netpoll(delta int64) {
 	})
 }
 
-func GCMask(x any) (ret []byte) {
+func PointerMask(x any) (ret []byte) {
 	systemstack(func() {
-		ret = getgcmask(x)
+		ret = pointerMask(x)
 	})
 	return
 }
@@ -363,7 +366,7 @@ func ReadMemStatsSlow() (base, slow MemStats) {
 		slow.Mallocs = 0
 		slow.Frees = 0
 		slow.HeapReleased = 0
-		var bySize [_NumSizeClasses]struct {
+		var bySize [gc.NumSizeClasses]struct {
 			Mallocs, Frees uint64
 		}
 
@@ -391,11 +394,11 @@ func ReadMemStatsSlow() (base, slow MemStats) {
 
 		// Collect per-sizeclass free stats.
 		var smallFree uint64
-		for i := 0; i < _NumSizeClasses; i++ {
+		for i := 0; i < gc.NumSizeClasses; i++ {
 			slow.Frees += m.smallFreeCount[i]
 			bySize[i].Frees += m.smallFreeCount[i]
 			bySize[i].Mallocs += m.smallFreeCount[i]
-			smallFree += m.smallFreeCount[i] * uint64(class_to_size[i])
+			smallFree += m.smallFreeCount[i] * uint64(gc.SizeClassToSize[i])
 		}
 		slow.Frees += m.tinyAllocCount + m.largeFreeCount
 		slow.Mallocs += slow.Frees
@@ -481,12 +484,6 @@ func (rw *RWMutex) Unlock() {
 	rw.rw.unlock()
 }
 
-const RuntimeHmapSize = unsafe.Sizeof(hmap{})
-
-func OverLoadFactor(count int, B uint8) bool {
-	return overLoadFactor(count, B)
-}
-
 func LockOSCounts() (external, internal uint32) {
 	gp := getg()
 	if gp.m.lockedExt+gp.m.lockedInt == 0 {
@@ -542,7 +539,7 @@ func MapNextArenaHint() (start, end uintptr, ok bool) {
 	} else {
 		start, end = addr, addr+heapArenaBytes
 	}
-	got := sysReserve(unsafe.Pointer(addr), physPageSize)
+	got := sysReserve(unsafe.Pointer(addr), physPageSize, "")
 	ok = (addr == uintptr(got))
 	if !ok {
 		// We were unable to get the requested reservation.
@@ -1237,6 +1234,7 @@ func AllocMSpan() *MSpan {
 	systemstack(func() {
 		lock(&mheap_.lock)
 		s = (*mspan)(mheap_.spanalloc.alloc())
+		s.init(0, 0)
 		unlock(&mheap_.lock)
 	})
 	return (*MSpan)(s)
@@ -1260,6 +1258,30 @@ func MSpanCountAlloc(ms *MSpan, bits []byte) int {
 	return result
 }
 
+type MSpanQueue mSpanQueue
+
+func (q *MSpanQueue) Size() int {
+	return (*mSpanQueue)(q).n
+}
+
+func (q *MSpanQueue) Push(s *MSpan) {
+	(*mSpanQueue)(q).push((*mspan)(s))
+}
+
+func (q *MSpanQueue) Pop() *MSpan {
+	s := (*mSpanQueue)(q).pop()
+	return (*MSpan)(s)
+}
+
+func (q *MSpanQueue) TakeAll(p *MSpanQueue) {
+	(*mSpanQueue)(q).takeAll((*mSpanQueue)(p))
+}
+
+func (q *MSpanQueue) PopN(n int) MSpanQueue {
+	p := (*mSpanQueue)(q).popN(n)
+	return (MSpanQueue)(p)
+}
+
 const (
 	TimeHistSubBucketBits = timeHistSubBucketBits
 	TimeHistNumSubBuckets = timeHistNumSubBuckets
@@ -1270,7 +1292,7 @@ const (
 
 type TimeHistogram timeHistogram
 
-// Counts returns the counts for the given bucket, subBucket indices.
+// Count returns the counts for the given bucket, subBucket indices.
 // Returns true if the bucket was valid, otherwise returns the counts
 // for the overflow bucket if bucket > 0 or the underflow bucket if
 // bucket < 0, and false.
@@ -1776,15 +1798,21 @@ func BlockUntilEmptyFinalizerQueue(timeout int64) bool {
 	return blockUntilEmptyFinalizerQueue(timeout)
 }
 
+func BlockUntilEmptyCleanupQueue(timeout int64) bool {
+	return gcCleanups.blockUntilEmpty(timeout)
+}
+
 func FrameStartLine(f *Frame) int {
 	return f.startLine
 }
 
 // PersistentAlloc allocates some memory that lives outside the Go heap.
 // This memory will never be freed; use sparingly.
-func PersistentAlloc(n uintptr) unsafe.Pointer {
-	return persistentalloc(n, 0, &memstats.other_sys)
+func PersistentAlloc(n, align uintptr) unsafe.Pointer {
+	return persistentalloc(n, align, &memstats.other_sys)
 }
+
+const TagAlign = tagAlign
 
 // FPCallers works like Callers and uses frame pointer unwinding to populate
 // pcBuf with the return addresses of the physical frames on the stack.
@@ -1842,4 +1870,46 @@ func (m *TraceMap) PutString(s string) (uint64, bool) {
 
 func (m *TraceMap) Reset() {
 	m.traceMap.reset()
+}
+
+func SetSpinInGCMarkDone(spin bool) {
+	gcDebugMarkDone.spinAfterRaggedBarrier.Store(spin)
+}
+
+func GCMarkDoneRestarted() bool {
+	// Only read this outside of the GC. If we're running during a GC, just report false.
+	mp := acquirem()
+	if gcphase != _GCoff {
+		releasem(mp)
+		return false
+	}
+	restarted := gcDebugMarkDone.restartedDueTo27993
+	releasem(mp)
+	return restarted
+}
+
+func GCMarkDoneResetRestartFlag() {
+	mp := acquirem()
+	for gcphase != _GCoff {
+		releasem(mp)
+		Gosched()
+		mp = acquirem()
+	}
+	gcDebugMarkDone.restartedDueTo27993 = false
+	releasem(mp)
+}
+
+type BitCursor struct {
+	b bitCursor
+}
+
+func NewBitCursor(buf *byte) BitCursor {
+	return BitCursor{b: bitCursor{ptr: buf, n: 0}}
+}
+
+func (b BitCursor) Write(data *byte, cnt uintptr) {
+	b.b.write(data, cnt)
+}
+func (b BitCursor) Offset(cnt uintptr) BitCursor {
+	return BitCursor{b: b.b.offset(cnt)}
 }

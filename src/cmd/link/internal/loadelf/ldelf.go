@@ -602,6 +602,14 @@ func Load(l *loader.Loader, arch *sys.Arch, localSymVersion int, f *bio.Reader, 
 					// See https://sourceware.org/bugzilla/show_bug.cgi?id=21809
 					continue
 				}
+
+				if arch.Family == sys.RISCV64 &&
+					(strings.HasPrefix(elfsym.name, "$d") || strings.HasPrefix(elfsym.name, "$x")) {
+					// Ignore RISC-V mapping symbols, which
+					// are similar to ARM64's case.
+					// See issue 73591.
+					continue
+				}
 			}
 
 			if strings.HasPrefix(elfsym.name, ".Linfo_string") {
@@ -609,7 +617,7 @@ func Load(l *loader.Loader, arch *sys.Arch, localSymVersion int, f *bio.Reader, 
 				continue
 			}
 
-			if strings.HasPrefix(elfsym.name, ".LASF") || strings.HasPrefix(elfsym.name, ".LLRL") || strings.HasPrefix(elfsym.name, ".LLST") {
+			if strings.HasPrefix(elfsym.name, ".LASF") || strings.HasPrefix(elfsym.name, ".LLRL") || strings.HasPrefix(elfsym.name, ".LLST") || strings.HasPrefix(elfsym.name, ".LVUS") {
 				// gcc on s390x and riscv64 does this.
 				continue
 			}
@@ -636,7 +644,7 @@ func Load(l *loader.Loader, arch *sys.Arch, localSymVersion int, f *bio.Reader, 
 		}
 		sb.SetValue(int64(elfsym.value))
 		sb.SetSize(int64(elfsym.size))
-		if sectsb.Type() == sym.STEXT {
+		if sectsb.Type().IsText() {
 			if l.AttrExternal(s) && !l.AttrDuplicateOK(s) {
 				return errorf("%s: duplicate symbol definition", sb.Name())
 			}
@@ -674,7 +682,7 @@ func Load(l *loader.Loader, arch *sys.Arch, localSymVersion int, f *bio.Reader, 
 		if l.SubSym(s) != 0 {
 			sb.SortSub()
 		}
-		if sb.Type() == sym.STEXT {
+		if sb.Type().IsText() {
 			if l.AttrOnList(s) {
 				return errorf("symbol %s listed multiple times",
 					l.SymName(s))

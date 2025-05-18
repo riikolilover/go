@@ -6,7 +6,6 @@ package amd64
 
 import (
 	"fmt"
-	"internal/buildcfg"
 	"math"
 
 	"cmd/compile/internal/base"
@@ -202,7 +201,7 @@ func getgFromTLS(s *ssagen.State, r int16) {
 
 func ssaGenValue(s *ssagen.State, v *ssa.Value) {
 	switch v.Op {
-	case ssa.OpAMD64VFMADD231SD:
+	case ssa.OpAMD64VFMADD231SD, ssa.OpAMD64VFMADD231SS:
 		p := s.Prog(v.Op.Asm())
 		p.From = obj.Addr{Type: obj.TYPE_REG, Reg: v.Args[2].Reg()}
 		p.To = obj.Addr{Type: obj.TYPE_REG, Reg: v.Reg()}
@@ -256,8 +255,38 @@ func ssaGenValue(s *ssagen.State, v *ssa.Value) {
 		ssa.OpAMD64POR, ssa.OpAMD64PXOR,
 		ssa.OpAMD64BTSL, ssa.OpAMD64BTSQ,
 		ssa.OpAMD64BTCL, ssa.OpAMD64BTCQ,
-		ssa.OpAMD64BTRL, ssa.OpAMD64BTRQ:
+		ssa.OpAMD64BTRL, ssa.OpAMD64BTRQ,
+		ssa.OpAMD64PCMPEQB, ssa.OpAMD64PSIGNB,
+		ssa.OpAMD64PUNPCKLBW:
 		opregreg(s, v.Op.Asm(), v.Reg(), v.Args[1].Reg())
+
+	case ssa.OpAMD64PSHUFLW:
+		p := s.Prog(v.Op.Asm())
+		imm := v.AuxInt
+		if imm < 0 || imm > 255 {
+			v.Fatalf("Invalid source selection immediate")
+		}
+		p.From.Offset = imm
+		p.From.Type = obj.TYPE_CONST
+		p.AddRestSourceReg(v.Args[0].Reg())
+		p.To.Type = obj.TYPE_REG
+		p.To.Reg = v.Reg()
+
+	case ssa.OpAMD64PSHUFBbroadcast:
+		// PSHUFB with a control mask of zero copies byte 0 to all
+		// bytes in the register.
+		//
+		// X15 is always zero with ABIInternal.
+		if s.ABI != obj.ABIInternal {
+			// zero X15 manually
+			opregreg(s, x86.AXORPS, x86.REG_X15, x86.REG_X15)
+		}
+
+		p := s.Prog(v.Op.Asm())
+		p.From.Type = obj.TYPE_REG
+		p.To.Type = obj.TYPE_REG
+		p.To.Reg = v.Reg()
+		p.From.Reg = x86.REG_X15
 
 	case ssa.OpAMD64SHRDQ, ssa.OpAMD64SHLDQ:
 		p := s.Prog(v.Op.Asm())
@@ -915,7 +944,7 @@ func ssaGenValue(s *ssagen.State, v *ssa.Value) {
 		ssagen.AddAux2(&p.To, v, sc.Off64())
 	case ssa.OpAMD64MOVLQSX, ssa.OpAMD64MOVWQSX, ssa.OpAMD64MOVBQSX, ssa.OpAMD64MOVLQZX, ssa.OpAMD64MOVWQZX, ssa.OpAMD64MOVBQZX,
 		ssa.OpAMD64CVTTSS2SL, ssa.OpAMD64CVTTSD2SL, ssa.OpAMD64CVTTSS2SQ, ssa.OpAMD64CVTTSD2SQ,
-		ssa.OpAMD64CVTSS2SD, ssa.OpAMD64CVTSD2SS:
+		ssa.OpAMD64CVTSS2SD, ssa.OpAMD64CVTSD2SS, ssa.OpAMD64VPBROADCASTB, ssa.OpAMD64PMOVMSKB:
 		opregreg(s, v.Op.Asm(), v.Reg(), v.Args[0].Reg())
 	case ssa.OpAMD64CVTSL2SD, ssa.OpAMD64CVTSQ2SD, ssa.OpAMD64CVTSQ2SS, ssa.OpAMD64CVTSL2SS:
 		r := v.Reg()
@@ -1060,9 +1089,7 @@ func ssaGenValue(s *ssagen.State, v *ssa.Value) {
 	case ssa.OpAMD64CALLstatic, ssa.OpAMD64CALLtail:
 		if s.ABI == obj.ABI0 && v.Aux.(*ssa.AuxCall).Fn.ABI() == obj.ABIInternal {
 			// zeroing X15 when entering ABIInternal from ABI0
-			if buildcfg.GOOS != "plan9" { // do not use SSE on Plan 9
-				opregreg(s, x86.AXORPS, x86.REG_X15, x86.REG_X15)
-			}
+			opregreg(s, x86.AXORPS, x86.REG_X15, x86.REG_X15)
 			// set G register from TLS
 			getgFromTLS(s, x86.REG_R14)
 		}
@@ -1073,9 +1100,7 @@ func ssaGenValue(s *ssagen.State, v *ssa.Value) {
 		s.Call(v)
 		if s.ABI == obj.ABIInternal && v.Aux.(*ssa.AuxCall).Fn.ABI() == obj.ABI0 {
 			// zeroing X15 when entering ABIInternal from ABI0
-			if buildcfg.GOOS != "plan9" { // do not use SSE on Plan 9
-				opregreg(s, x86.AXORPS, x86.REG_X15, x86.REG_X15)
-			}
+			opregreg(s, x86.AXORPS, x86.REG_X15, x86.REG_X15)
 			// set G register from TLS
 			getgFromTLS(s, x86.REG_R14)
 		}
@@ -1129,6 +1154,31 @@ func ssaGenValue(s *ssagen.State, v *ssa.Value) {
 		p.To.Type = obj.TYPE_REG
 		p.To.Reg = v.Reg0()
 
+	case ssa.OpAMD64ADDQconstflags, ssa.OpAMD64ADDLconstflags:
+		p := s.Prog(v.Op.Asm())
+		p.From.Type = obj.TYPE_CONST
+		p.From.Offset = v.AuxInt
+		// Note: the inc/dec instructions do not modify
+		// the carry flag like add$1 / sub$1 do.
+		// We currently never use the CF/OF flags from
+		// these instructions, so that is ok.
+		switch {
+		case p.As == x86.AADDQ && p.From.Offset == 1:
+			p.As = x86.AINCQ
+			p.From.Type = obj.TYPE_NONE
+		case p.As == x86.AADDQ && p.From.Offset == -1:
+			p.As = x86.ADECQ
+			p.From.Type = obj.TYPE_NONE
+		case p.As == x86.AADDL && p.From.Offset == 1:
+			p.As = x86.AINCL
+			p.From.Type = obj.TYPE_NONE
+		case p.As == x86.AADDL && p.From.Offset == -1:
+			p.As = x86.ADECL
+			p.From.Type = obj.TYPE_NONE
+		}
+		p.To.Type = obj.TYPE_REG
+		p.To.Reg = v.Reg0()
+
 	case ssa.OpAMD64BSFQ, ssa.OpAMD64BSRQ, ssa.OpAMD64BSFL, ssa.OpAMD64BSRL, ssa.OpAMD64SQRTSD, ssa.OpAMD64SQRTSS:
 		p := s.Prog(v.Op.Asm())
 		p.From.Type = obj.TYPE_REG
@@ -1140,6 +1190,8 @@ func ssaGenValue(s *ssagen.State, v *ssa.Value) {
 		case ssa.OpAMD64BSFL, ssa.OpAMD64BSRL, ssa.OpAMD64SQRTSD, ssa.OpAMD64SQRTSS:
 			p.To.Reg = v.Reg()
 		}
+	case ssa.OpAMD64LoweredRound32F, ssa.OpAMD64LoweredRound64F:
+		// input is already rounded
 	case ssa.OpAMD64ROUNDSD:
 		p := s.Prog(v.Op.Asm())
 		val := v.AuxInt
@@ -1409,24 +1461,7 @@ var nefJumps = [2][2]ssagen.IndexJump{
 
 func ssaGenBlock(s *ssagen.State, b, next *ssa.Block) {
 	switch b.Kind {
-	case ssa.BlockPlain:
-		if b.Succs[0].Block() != next {
-			p := s.Prog(obj.AJMP)
-			p.To.Type = obj.TYPE_BRANCH
-			s.Branches = append(s.Branches, ssagen.Branch{P: p, B: b.Succs[0].Block()})
-		}
-	case ssa.BlockDefer:
-		// defer returns in rax:
-		// 0 if we should continue executing
-		// 1 if we should jump to deferreturn call
-		p := s.Prog(x86.ATESTL)
-		p.From.Type = obj.TYPE_REG
-		p.From.Reg = x86.REG_AX
-		p.To.Type = obj.TYPE_REG
-		p.To.Reg = x86.REG_AX
-		p = s.Prog(x86.AJNE)
-		p.To.Type = obj.TYPE_BRANCH
-		s.Branches = append(s.Branches, ssagen.Branch{P: p, B: b.Succs[1].Block()})
+	case ssa.BlockPlain, ssa.BlockDefer:
 		if b.Succs[0].Block() != next {
 			p := s.Prog(obj.AJMP)
 			p.To.Type = obj.TYPE_BRANCH

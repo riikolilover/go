@@ -130,13 +130,14 @@ package runtime
 
 import (
 	"internal/cpu"
+	"internal/goarch"
 	"internal/runtime/atomic"
+	"internal/runtime/gc"
 	"unsafe"
 )
 
 const (
-	_DebugGC      = 0
-	_FinBlockSize = 4 * 1024
+	_DebugGC = 0
 
 	// concurrentSweep is a debug flag. Disabling this flag
 	// ensures all spans are swept while the world is stopped.
@@ -186,11 +187,18 @@ func gcinit() {
 	// Use the environment variable GOMEMLIMIT for the initial memoryLimit value.
 	gcController.init(readGOGC(), readGOMEMLIMIT())
 
+	// Set up the cleanup block ptr mask.
+	for i := range cleanupBlockPtrMask {
+		cleanupBlockPtrMask[i] = 0xff
+	}
+
 	work.startSema = 1
 	work.markDoneSema = 1
 	lockInit(&work.sweepWaiters.lock, lockRankSweepWaiters)
 	lockInit(&work.assistQueue.lock, lockRankAssistQueue)
+	lockInit(&work.strongFromWeak.lock, lockRankStrongFromWeakQueue)
 	lockInit(&work.wbufSpans.lock, lockRankWbufSpans)
+	lockInit(&gcCleanups.lock, lockRankCleanupQueue)
 }
 
 // gcenable is called after the bulk of the runtime initialization,
@@ -328,17 +336,24 @@ type workType struct {
 		// one of the workbuf lists.
 		busy mSpanList
 	}
+	_ cpu.CacheLinePad // prevents false-sharing between wbufSpans and spanq
+
+	// Global queue of spans to scan.
+	//
+	// Only used if goexperiment.GreenTeaGC.
+	spanq spanQueue
 
 	// Restore 64-bit alignment on 32-bit.
-	_ uint32
+	// _ uint32
 
 	// bytesMarked is the number of bytes marked this cycle. This
 	// includes bytes blackened in scanned objects, noscan objects
-	// that go straight to black, and permagrey objects scanned by
-	// markroot during the concurrent scan phase. This is updated
-	// atomically during the cycle. Updates may be batched
-	// arbitrarily, since the value is only read at the end of the
-	// cycle.
+	// that go straight to black, objects allocated as black during
+	// the cycle, and permagrey objects scanned by markroot during
+	// the concurrent scan phase.
+	//
+	// This is updated atomically during the cycle. Updates may be batched
+	// arbitrarily, since the value is only read at the end of the cycle.
 	//
 	// Because of benign races during marking, this number may not
 	// be the exact number of marked bytes, but it should be very
@@ -415,6 +430,26 @@ type workType struct {
 	sweepWaiters struct {
 		lock mutex
 		list gList
+	}
+
+	// strongFromWeak controls how the GC interacts with weak->strong
+	// pointer conversions.
+	strongFromWeak struct {
+		// block is a flag set during mark termination that prevents
+		// new weak->strong conversions from executing by blocking the
+		// goroutine and enqueuing it onto q.
+		//
+		// Mutated only by one goroutine at a time in gcMarkDone,
+		// with globally-synchronizing events like forEachP and
+		// stopTheWorld.
+		block bool
+
+		// q is a queue of goroutines that attempted to perform a
+		// weak->strong conversion during mark termination.
+		//
+		// Protected by lock.
+		lock mutex
+		q    gQueue
 	}
 
 	// cycles is the number of completed GC cycles, where a GC
@@ -617,6 +652,17 @@ func gcStart(trigger gcTrigger) {
 	releasem(mp)
 	mp = nil
 
+	if gp := getg(); gp.bubble != nil {
+		// Disassociate the G from its synctest bubble while allocating.
+		// This is less elegant than incrementing the group's active count,
+		// but avoids any contamination between GC and synctest.
+		bubble := gp.bubble
+		gp.bubble = nil
+		defer func() {
+			gp.bubble = bubble
+		}()
+	}
+
 	// Pick up the remaining unswept/not being swept spans concurrently
 	//
 	// This shouldn't happen if we're being invoked in background
@@ -669,6 +715,10 @@ func gcStart(trigger gcTrigger) {
 		if fg := p.mcache.flushGen.Load(); fg != mheap_.sweepgen {
 			println("runtime: p", p.id, "flushGen", fg, "!= sweepgen", mheap_.sweepgen)
 			throw("p mcache not flushed")
+		}
+		// Initialize ptrBuf if necessary.
+		if p.gcw.ptrBuf == nil {
+			p.gcw.ptrBuf = (*[gc.PageSize / goarch.PtrSize]uintptr)(persistentalloc(gc.PageSize, goarch.PtrSize, &memstats.gcMiscSys))
 		}
 	}
 
@@ -799,6 +849,19 @@ func gcStart(trigger gcTrigger) {
 // This is protected by markDoneSema.
 var gcMarkDoneFlushed uint32
 
+// gcDebugMarkDone contains fields used to debug/test mark termination.
+var gcDebugMarkDone struct {
+	// spinAfterRaggedBarrier forces gcMarkDone to spin after it executes
+	// the ragged barrier.
+	spinAfterRaggedBarrier atomic.Bool
+
+	// restartedDueTo27993 indicates that we restarted mark termination
+	// due to the bug described in issue #27993.
+	//
+	// Protected by worldsema.
+	restartedDueTo27993 bool
+}
+
 // gcMarkDone transitions the GC from mark to mark termination if all
 // reachable objects have been marked (that is, there are no grey
 // objects and can be no more in the future). Otherwise, it flushes
@@ -841,6 +904,10 @@ top:
 	// stop the world later, so acquire worldsema now.
 	semacquire(&worldsema)
 
+	// Prevent weak->strong conversions from generating additional
+	// GC work. forEachP will guarantee that it is observed globally.
+	work.strongFromWeak.block = true
+
 	// Flush all local buffers and collect flushedWork flags.
 	gcMarkDoneFlushed = 0
 	forEachP(waitReasonGCMarkTermination, func(pp *p) {
@@ -869,6 +936,10 @@ top:
 		// ragged barrier, so re-check it.
 		semrelease(&worldsema)
 		goto top
+	}
+
+	// For debugging/testing.
+	for gcDebugMarkDone.spinAfterRaggedBarrier.Load() {
 	}
 
 	// There was no global work, no local work, and no Ps
@@ -909,6 +980,8 @@ top:
 		}
 	})
 	if restart {
+		gcDebugMarkDone.restartedDueTo27993 = true
+
 		getg().m.preemptoff = ""
 		systemstack(func() {
 			// Accumulate the time we were stopped before we had to start again.
@@ -934,6 +1007,11 @@ top:
 	// Wake all blocked assists. These will run when we
 	// start the world again.
 	gcWakeAllAssists()
+
+	// Wake all blocked weak->strong conversions. These will run
+	// when we start the world again.
+	work.strongFromWeak.block = false
+	gcWakeAllStrongFromWeak()
 
 	// Likewise, release the transition lock. Blocked
 	// workers and assists will run when we start the
@@ -995,13 +1073,22 @@ func gcMarkTermination(stw worldStop) {
 			// mark using checkmark bits, to check that we
 			// didn't forget to mark anything during the
 			// concurrent mark process.
+			//
+			// Turn off gcwaiting because that will force
+			// gcDrain to return early if this goroutine
+			// happens to have its preemption flag set.
+			// This is fine because the world is stopped.
+			// Restore it after we're done just to be safe.
+			sched.gcwaiting.Store(false)
 			startCheckmarks()
 			gcResetMarkState()
+			gcMarkRootPrepare()
 			gcw := &getg().m.p.ptr().gcw
 			gcDrain(gcw, 0)
 			wbBufFlush1(getg().m.p.ptr())
 			gcw.dispose()
 			endCheckmarks()
+			sched.gcwaiting.Store(true)
 		}
 
 		// marking is complete so we can turn the write barrier off
@@ -1149,6 +1236,9 @@ func gcMarkTermination(stw worldStop) {
 	//
 	// Also, flush the pinner cache, to avoid leaking that memory
 	// indefinitely.
+	if debug.gctrace > 1 {
+		clear(memstats.lastScanStats[:])
+	}
 	forEachP(waitReasonFlushProcCaches, func(pp *p) {
 		pp.mcache.prepareForSweep()
 		if pp.status == _Pidle {
@@ -1157,6 +1247,16 @@ func gcMarkTermination(stw worldStop) {
 				pp.pcache.flush(&mheap_.pages)
 				unlock(&mheap_.lock)
 			})
+		}
+		if debug.gctrace > 1 {
+			for i := range pp.gcw.stats {
+				memstats.lastScanStats[i].spansDenseScanned += pp.gcw.stats[i].spansDenseScanned
+				memstats.lastScanStats[i].spanObjsDenseScanned += pp.gcw.stats[i].spanObjsDenseScanned
+				memstats.lastScanStats[i].spansSparseScanned += pp.gcw.stats[i].spansSparseScanned
+				memstats.lastScanStats[i].spanObjsSparseScanned += pp.gcw.stats[i].spanObjsSparseScanned
+				memstats.lastScanStats[i].sparseObjsScanned += pp.gcw.stats[i].sparseObjsScanned
+			}
+			clear(pp.gcw.stats[:])
 		}
 		pp.pinnerCache = nil
 	})
@@ -1215,6 +1315,41 @@ func gcMarkTermination(stw worldStop) {
 			print(" (forced)")
 		}
 		print("\n")
+
+		if debug.gctrace > 1 {
+			var (
+				spansDenseScanned     uint64
+				spanObjsDenseScanned  uint64
+				spansSparseScanned    uint64
+				spanObjsSparseScanned uint64
+				sparseObjsScanned     uint64
+			)
+			for _, stats := range memstats.lastScanStats {
+				spansDenseScanned += stats.spansDenseScanned
+				spanObjsDenseScanned += stats.spanObjsDenseScanned
+				spansSparseScanned += stats.spansSparseScanned
+				spanObjsSparseScanned += stats.spanObjsSparseScanned
+				sparseObjsScanned += stats.sparseObjsScanned
+			}
+			totalObjs := sparseObjsScanned + spanObjsSparseScanned + spanObjsDenseScanned
+			totalSpans := spansSparseScanned + spansDenseScanned
+			print("scan: total ", sparseObjsScanned, "+", spanObjsSparseScanned, "+", spanObjsDenseScanned, "=", totalObjs, " objs")
+			print(", ", spansSparseScanned, "+", spansDenseScanned, "=", totalSpans, " spans\n")
+			for i, stats := range memstats.lastScanStats {
+				if stats == (sizeClassScanStats{}) {
+					continue
+				}
+				totalObjs := stats.sparseObjsScanned + stats.spanObjsSparseScanned + stats.spanObjsDenseScanned
+				totalSpans := stats.spansSparseScanned + stats.spansDenseScanned
+				if i == 0 {
+					print("scan: class L ")
+				} else {
+					print("scan: class ", gc.SizeClassToSize[i], "B ")
+				}
+				print(stats.sparseObjsScanned, "+", stats.spanObjsSparseScanned, "+", stats.spanObjsDenseScanned, "=", totalObjs, " objs")
+				print(", ", stats.spansSparseScanned, "+", stats.spansDenseScanned, "=", totalSpans, " spans\n")
+			}
+		}
 		printunlock()
 	}
 
@@ -1323,6 +1458,12 @@ type gcBgMarkWorkerNode struct {
 	// gcBgMarkWorker().
 	m muintptr
 }
+type gcBgMarkWorkerNodePadded struct {
+	gcBgMarkWorkerNode
+	pad [tagAlign - unsafe.Sizeof(gcBgMarkWorkerNode{}) - gcBgMarkWorkerNodeRedZoneSize]byte
+}
+
+const gcBgMarkWorkerNodeRedZoneSize = (16 << 2) * asanenabledBit // redZoneSize(512)
 
 func gcBgMarkWorker(ready chan struct{}) {
 	gp := getg()
@@ -1331,7 +1472,7 @@ func gcBgMarkWorker(ready chan struct{}) {
 	// the stack (see gopark). Prevent deadlock from recursively
 	// starting GC by disabling preemption.
 	gp.m.preemptoff = "GC worker init"
-	node := new(gcBgMarkWorkerNode)
+	node := &new(gcBgMarkWorkerNodePadded).gcBgMarkWorkerNode // TODO: technically not allowed in the heap. See comment in tagptr.go.
 	gp.m.preemptoff = ""
 
 	node.gp.set(gp)
@@ -1443,9 +1584,9 @@ func gcBgMarkWorker(ready chan struct{}) {
 					// everything out of the run
 					// queue so it can run
 					// somewhere else.
-					if drainQ, n := runqdrain(pp); n > 0 {
+					if drainQ := runqdrain(pp); !drainQ.empty() {
 						lock(&sched.lock)
-						globrunqputbatch(&drainQ, int32(n))
+						globrunqputbatch(&drainQ)
 						unlock(&sched.lock)
 					}
 				}
@@ -1483,7 +1624,7 @@ func gcBgMarkWorker(ready chan struct{}) {
 		// We'll releasem after this point and thus this P may run
 		// something else. We must clear the worker mode to avoid
 		// attributing the mode to a different (non-worker) G in
-		// traceGoStart.
+		// tracev2.GoStart.
 		pp.gcMarkWorkerMode = gcMarkWorkerNotWorker
 
 		// If this worker reached a background mark completion
@@ -1507,7 +1648,7 @@ func gcMarkWorkAvailable(p *p) bool {
 	if p != nil && !p.gcw.empty() {
 		return true
 	}
-	if !work.full.empty() {
+	if !work.full.empty() || !work.spanq.empty() {
 		return true // global work available
 	}
 	if work.markrootNext < work.markrootJobs {
@@ -1526,8 +1667,8 @@ func gcMark(startTime int64) {
 	work.tstart = startTime
 
 	// Check that there's no marking work remaining.
-	if work.full != 0 || work.markrootNext < work.markrootJobs {
-		print("runtime: full=", hex(work.full), " next=", work.markrootNext, " jobs=", work.markrootJobs, " nDataRoots=", work.nDataRoots, " nBSSRoots=", work.nBSSRoots, " nSpanRoots=", work.nSpanRoots, " nStackRoots=", work.nStackRoots, "\n")
+	if work.full != 0 || work.markrootNext < work.markrootJobs || !work.spanq.empty() {
+		print("runtime: full=", hex(work.full), " next=", work.markrootNext, " jobs=", work.markrootJobs, " nDataRoots=", work.nDataRoots, " nBSSRoots=", work.nBSSRoots, " nSpanRoots=", work.nSpanRoots, " nStackRoots=", work.nStackRoots, " spanq.n=", work.spanq.size(), "\n")
 		panic("non-empty mark queue after concurrent mark")
 	}
 
@@ -1623,7 +1764,7 @@ func gcSweep(mode gcMode) bool {
 	mheap_.sweepgen += 2
 	sweep.active.reset()
 	mheap_.pagesSwept.Store(0)
-	mheap_.sweepArenas = mheap_.allArenas
+	mheap_.sweepArenas = mheap_.heapArenas
 	mheap_.reclaimIndex.Store(0)
 	mheap_.reclaimCredit.Store(0)
 	unlock(&mheap_.lock)
@@ -1686,7 +1827,7 @@ func gcResetMarkState() {
 	// Clear page marks. This is just 1MB per 64GB of heap, so the
 	// time here is pretty trivial.
 	lock(&mheap_.lock)
-	arenas := mheap_.allArenas
+	arenas := mheap_.heapArenas
 	unlock(&mheap_.lock)
 	for _, ai := range arenas {
 		ha := mheap_.arenas[ai.l1()][ai.l2()]
@@ -1700,8 +1841,7 @@ func gcResetMarkState() {
 // Hooks for other packages
 
 var poolcleanup func()
-var boringCaches []unsafe.Pointer  // for crypto/internal/boring
-var uniqueMapCleanup chan struct{} // for unique
+var boringCaches []unsafe.Pointer // for crypto/internal/boring
 
 // sync_runtime_registerPoolCleanup should be an internal detail,
 // but widely used packages access it using linkname.
@@ -1722,18 +1862,6 @@ func boring_registerCache(p unsafe.Pointer) {
 	boringCaches = append(boringCaches, p)
 }
 
-//go:linkname unique_runtime_registerUniqueMapCleanup unique.runtime_registerUniqueMapCleanup
-func unique_runtime_registerUniqueMapCleanup(f func()) {
-	// Start the goroutine in the runtime so it's counted as a system goroutine.
-	uniqueMapCleanup = make(chan struct{}, 1)
-	go func(cleanup func()) {
-		for {
-			<-uniqueMapCleanup
-			cleanup()
-		}
-	}(f)
-}
-
 func clearpools() {
 	// clear sync.Pools
 	if poolcleanup != nil {
@@ -1743,14 +1871,6 @@ func clearpools() {
 	// clear boringcrypto caches
 	for _, p := range boringCaches {
 		atomicstorep(p, nil)
-	}
-
-	// clear unique maps
-	if uniqueMapCleanup != nil {
-		select {
-		case uniqueMapCleanup <- struct{}{}:
-		default:
-		}
 	}
 
 	// Clear central sudog cache.
@@ -1858,7 +1978,7 @@ func gcTestIsReachable(ptrs ...unsafe.Pointer) (mask uint64) {
 		s := (*specialReachable)(mheap_.specialReachableAlloc.alloc())
 		unlock(&mheap_.speciallock)
 		s.special.kind = _KindSpecialReachable
-		if !addspecial(p, &s.special) {
+		if !addspecial(p, &s.special, false) {
 			throw("already have a reachable special (duplicate pointer?)")
 		}
 		specials[i] = s

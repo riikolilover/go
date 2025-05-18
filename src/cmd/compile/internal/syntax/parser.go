@@ -300,7 +300,11 @@ func tokstring(tok token) string {
 	case _Semi:
 		return "semicolon or newline"
 	}
-	return tok.String()
+	s := tok.String()
+	if _Break <= tok && tok <= _Var {
+		return "keyword " + s
+	}
+	return s
 }
 
 // Convenience methods using the current token position.
@@ -646,7 +650,7 @@ func (p *parser) typeDecl(group *Group) Decl {
 				// d.Name "[" pname ...
 				// d.Name "[" pname ptype ...
 				// d.Name "[" pname ptype "," ...
-				d.TParamList = p.paramList(pname, ptype, _Rbrack, true) // ptype may be nil
+				d.TParamList = p.paramList(pname, ptype, _Rbrack, true, false) // ptype may be nil
 				d.Alias = p.gotAssign()
 				d.Type = p.typeOrNil()
 			} else {
@@ -796,7 +800,7 @@ func (p *parser) funcDeclOrNil() *FuncDecl {
 	var context string
 	if p.got(_Lparen) {
 		context = "method"
-		rcvr := p.paramList(nil, nil, _Rparen, false)
+		rcvr := p.paramList(nil, nil, _Rparen, false, false)
 		switch len(rcvr) {
 		case 0:
 			p.error("method has no receiver")
@@ -1465,12 +1469,12 @@ func (p *parser) funcType(context string) ([]*Field, *FuncType) {
 			p.syntaxError("empty type parameter list")
 			p.next()
 		} else {
-			tparamList = p.paramList(nil, nil, _Rbrack, true)
+			tparamList = p.paramList(nil, nil, _Rbrack, true, false)
 		}
 	}
 
 	p.want(_Lparen)
-	typ.ParamList = p.paramList(nil, nil, _Rparen, false)
+	typ.ParamList = p.paramList(nil, nil, _Rparen, false, true)
 	typ.ResultList = p.funcResult()
 
 	return tparamList, typ
@@ -1578,7 +1582,7 @@ func (p *parser) funcResult() []*Field {
 	}
 
 	if p.got(_Lparen) {
-		return p.paramList(nil, nil, _Rparen, false)
+		return p.paramList(nil, nil, _Rparen, false, false)
 	}
 
 	pos := p.pos()
@@ -1789,7 +1793,7 @@ func (p *parser) methodDecl() *Field {
 
 		// A type argument list looks like a parameter list with only
 		// types. Parse a parameter list and decide afterwards.
-		list := p.paramList(nil, nil, _Rbrack, false)
+		list := p.paramList(nil, nil, _Rbrack, false, false)
 		if len(list) == 0 {
 			// The type parameter list is not [] but we got nothing
 			// due to other errors (reported by paramList). Treat
@@ -1958,10 +1962,11 @@ func (p *parser) paramDeclOrNil(name *Name, follow token) *Field {
 		p.next()
 		t.Elem = p.typeOrNil()
 		if t.Elem == nil {
-			t.Elem = p.badExpr()
+			f.Type = p.badExpr()
 			p.syntaxError("... is missing type")
+		} else {
+			f.Type = t
 		}
-		f.Type = t
 		return f
 	}
 
@@ -1991,7 +1996,7 @@ func (p *parser) paramDeclOrNil(name *Name, follow token) *Field {
 // If name != nil, it is the first name after "(" or "[".
 // If typ != nil, name must be != nil, and (name, typ) is the first field in the list.
 // In the result list, either all fields have a name, or no field has a name.
-func (p *parser) paramList(name *Name, typ Expr, close token, requireNames bool) (list []*Field) {
+func (p *parser) paramList(name *Name, typ Expr, close token, requireNames, dddok bool) (list []*Field) {
 	if trace {
 		defer p.trace("paramList")()
 	}
@@ -2075,28 +2080,50 @@ func (p *parser) paramList(name *Name, typ Expr, close token, requireNames bool)
 			}
 		}
 		if errPos.IsKnown() {
+			// Not all parameters are named because named != len(list).
+			// If named == typed, there must be parameters that have no types.
+			// They must be at the end of the parameter list, otherwise types
+			// would have been filled in by the right-to-left sweep above and
+			// there would be no error.
+			// If requireNames is set, the parameter list is a type parameter
+			// list.
 			var msg string
-			if requireNames {
-				// Not all parameters are named because named != len(list).
-				// If named == typed we must have parameters that have no types,
-				// and they must be at the end of the parameter list, otherwise
-				// the types would have been filled in by the right-to-left sweep
-				// above and we wouldn't have an error. Since we are in a type
-				// parameter list, the missing types are constraints.
-				if named == typed {
-					errPos = end // position error at closing ]
+			if named == typed {
+				errPos = end // position error at closing token ) or ]
+				if requireNames {
 					msg = "missing type constraint"
 				} else {
+					msg = "missing parameter type"
+				}
+			} else {
+				if requireNames {
 					msg = "missing type parameter name"
 					// go.dev/issue/60812
 					if len(list) == 1 {
 						msg += " or invalid array length"
 					}
+				} else {
+					msg = "missing parameter name"
 				}
-			} else {
-				msg = "mixed named and unnamed parameters"
 			}
 			p.syntaxErrorAt(errPos, msg)
+		}
+	}
+
+	// check use of ...
+	first := true // only report first occurrence
+	for i, f := range list {
+		if t, _ := f.Type.(*DotsType); t != nil && (!dddok || i+1 < len(list)) {
+			if first {
+				first = false
+				if dddok {
+					p.errorAt(t.pos, "can only use ... with final parameter")
+				} else {
+					p.errorAt(t.pos, "invalid use of ...")
+				}
+			}
+			// use T instead of invalid ...T
+			f.Type = t.Elem
 		}
 	}
 
@@ -2332,7 +2359,7 @@ func (p *parser) header(keyword token) (init SimpleStmt, cond Expr, post SimpleS
 	if p.tok != _Semi {
 		// accept potential varDecl but complain
 		if p.got(_Var) {
-			p.syntaxError(fmt.Sprintf("var declaration not allowed in %s initializer", tokstring(keyword)))
+			p.syntaxError(fmt.Sprintf("var declaration not allowed in %s initializer", keyword.String()))
 		}
 		init = p.simpleStmt(nil, keyword)
 		// If we have a range clause, we are done (can only happen for keyword == _For).

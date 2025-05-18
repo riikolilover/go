@@ -83,7 +83,7 @@ func (f *File) offset(p token.Pos) int {
 }
 
 func nameKeys(m map[string]*Name) []string {
-	var ks []string
+	ks := make([]string, 0, len(m))
 	for k := range m {
 		ks = append(ks, k)
 	}
@@ -390,7 +390,7 @@ func main() {
 	// We already put _cgo_ at the beginning, so the main
 	// concern is other cgo wrappers for the same functions.
 	// Use the beginning of the 16 bytes hash of the input to disambiguate.
-	h := hash.New16()
+	h := hash.New32()
 	io.WriteString(h, *importPath)
 	var once sync.Once
 	var wg sync.WaitGroup

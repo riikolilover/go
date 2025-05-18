@@ -70,6 +70,7 @@ type vcsRepo struct {
 	remote string
 	cmd    *vcsCmd
 	dir    string
+	local  bool
 
 	tagsOnce sync.Once
 	tags     map[string]bool
@@ -85,15 +86,27 @@ func newVCSRepo(ctx context.Context, vcs, remote string, local bool) (Repo, erro
 	if vcs == "git" {
 		return newGitRepo(ctx, remote, local)
 	}
+	r := &vcsRepo{remote: remote, local: local}
 	cmd := vcsCmds[vcs]
 	if cmd == nil {
 		return nil, fmt.Errorf("unknown vcs: %s %s", vcs, remote)
 	}
+	r.cmd = cmd
+	if local {
+		info, err := os.Stat(remote)
+		if err != nil {
+			return nil, err
+		}
+		if !info.IsDir() {
+			return nil, fmt.Errorf("%s exists but is not a directory", remote)
+		}
+		r.dir = remote
+		r.mu.Path = r.dir + ".lock"
+		return r, nil
+	}
 	if !strings.Contains(remote, "://") {
 		return nil, fmt.Errorf("invalid vcs remote: %s %s", vcs, remote)
 	}
-
-	r := &vcsRepo{remote: remote, cmd: cmd}
 	var err error
 	r.dir, r.mu.Path, err = WorkDir(ctx, vcsWorkDirType+vcs, r.remote)
 	if err != nil {
@@ -341,6 +354,11 @@ func (r *vcsRepo) Stat(ctx context.Context, rev string) (*RevInfo, error) {
 		rev = r.cmd.latest
 	}
 	r.branchesOnce.Do(func() { r.loadBranches(ctx) })
+	if r.local {
+		// Ignore the badLocalRevRE precondition in local only mode.
+		// We cannot fetch latest upstream changes so only serve what's in the local cache.
+		return r.statLocal(ctx, rev)
+	}
 	revOK := (r.cmd.badLocalRevRE == nil || !r.cmd.badLocalRevRE.MatchString(rev)) && !r.branches[rev]
 	if revOK {
 		if info, err := r.statLocal(ctx, rev); err == nil {
@@ -542,6 +560,7 @@ func hgParseStat(rev, out string) (*RevInfo, error) {
 func bzrParseStat(rev, out string) (*RevInfo, error) {
 	var revno int64
 	var tm time.Time
+	var tags []string
 	for _, line := range strings.Split(out, "\n") {
 		if line == "" || line[0] == ' ' || line[0] == '\t' {
 			// End of header, start of commit message.
@@ -576,6 +595,8 @@ func bzrParseStat(rev, out string) (*RevInfo, error) {
 				return nil, vcsErrorf("unexpected timestamp from bzr log: %q", line)
 			}
 			tm = t.UTC()
+		case "tags":
+			tags = strings.Split(val, ", ")
 		}
 	}
 	if revno == 0 || tm.IsZero() {
@@ -587,6 +608,7 @@ func bzrParseStat(rev, out string) (*RevInfo, error) {
 		Short:   fmt.Sprintf("%012d", revno),
 		Time:    tm,
 		Version: rev,
+		Tags:    tags,
 	}
 	return info, nil
 }

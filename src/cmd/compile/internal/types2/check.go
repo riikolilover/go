@@ -20,6 +20,9 @@ var nopos syntax.Pos
 // debugging/development support
 const debug = false // leave on during development
 
+// position tracing for panics during type checking
+const tracePos = false // TODO(markfreeman): check performance implications
+
 // _aliasAny changes the behavior of [Scope.Lookup] for "any" in the
 // [Universe] scope.
 //
@@ -56,7 +59,7 @@ type exprInfo struct {
 type environment struct {
 	decl          *declInfo                 // package-level declaration whose init expression/function body is checked
 	scope         *Scope                    // top-most scope for lookups
-	pos           syntax.Pos                // if valid, identifiers are looked up as if at position pos (used by Eval)
+	version       goVersion                 // current accepted language version; changes across files
 	iota          constant.Value            // value of iota in a constant declaration; nil otherwise
 	errpos        syntax.Pos                // if valid, identifier position of a constant with inherited initializer
 	inTParamList  bool                      // set if inside a type parameter list
@@ -66,9 +69,26 @@ type environment struct {
 	hasCallOrRecv bool                      // set if an expression contains a function call or channel receive operation
 }
 
-// lookup looks up name in the current environment and returns the matching object, or nil.
+// lookupScope looks up name in the current environment and if an object
+// is found it returns the scope containing the object and the object.
+// Otherwise it returns (nil, nil).
+//
+// Note that obj.Parent() may be different from the returned scope if the
+// object was inserted into the scope and already had a parent at that
+// time (see Scope.Insert). This can only happen for dot-imported objects
+// whose parent is the scope of the package that exported them.
+func (env *environment) lookupScope(name string) (*Scope, Object) {
+	for s := env.scope; s != nil; s = s.parent {
+		if obj := s.Lookup(name); obj != nil {
+			return s, obj
+		}
+	}
+	return nil, nil
+}
+
+// lookup is like lookupScope but it only returns the object (or nil).
 func (env *environment) lookup(name string) Object {
-	_, obj := env.scope.LookupParent(name, env.pos)
+	_, obj := env.lookupScope(name)
 	return obj
 }
 
@@ -90,8 +110,9 @@ type dotImportKey struct {
 
 // An action describes a (delayed) action.
 type action struct {
-	f    func()      // action to be executed
-	desc *actionDesc // action description; may be nil, requires debug to be set
+	version goVersion   // applicable language version
+	f       func()      // action to be executed
+	desc    *actionDesc // action description; may be nil, requires debug to be set
 }
 
 // If debug is set, describef sets a printf-formatted description for action a.
@@ -119,10 +140,9 @@ type Checker struct {
 	ctxt *Context // context for de-duplicating instances
 	pkg  *Package
 	*Info
-	version goVersion              // accepted language version
-	nextID  uint64                 // unique Id for type parameters (first valid Id is 1)
-	objMap  map[Object]*declInfo   // maps package-level objects and (non-interface) methods to declaration info
-	impMap  map[importKey]*Package // maps (import path, source directory) to (complete or fake) package
+	nextID uint64                 // unique Id for type parameters (first valid Id is 1)
+	objMap map[Object]*declInfo   // maps package-level objects and (non-interface) methods to declaration info
+	impMap map[importKey]*Package // maps (import path, source directory) to (complete or fake) package
 	// see TODO in validtype.go
 	// valids  instanceLookup      // valid *Named (incl. instantiated) types per the validType check
 
@@ -140,11 +160,13 @@ type Checker struct {
 	// (initialized by Files, valid only for the duration of check.Files;
 	// maps and lists are allocated on demand)
 	files         []*syntax.File             // list of package files
-	versions      map[*syntax.PosBase]string // maps files to version strings (each file has an entry); shared with Info.FileVersions if present
+	versions      map[*syntax.PosBase]string // maps files to version strings (each file has an entry); shared with Info.FileVersions if present; may be unaltered Config.GoVersion
 	imports       []*PkgName                 // list of imported packages
 	dotImportMap  map[dotImportKey]*PkgName  // maps dot-imported objects to the package they were dot-imported through
 	brokenAliases map[*TypeName]bool         // set of aliases with broken (not yet determined) types
 	unionTypeSets map[*Union]*_TypeSet       // computed type sets for union types
+	usedVars      map[*Var]bool              // set of used variables
+	usedPkgNames  map[*PkgName]bool          // set of used package names
 	mono          monoGraph                  // graph for detecting non-monomorphizable instantiation loops
 
 	firstErr error                    // first error encountered
@@ -159,7 +181,8 @@ type Checker struct {
 	environment
 
 	// debugging
-	indent int // indentation for tracing
+	posStack []syntax.Pos // stack of source positions seen; used for panic tracing
+	indent   int          // indentation for tracing
 }
 
 // addDeclDep adds the dependency edge (check.decl -> to) if check.decl exists
@@ -219,7 +242,7 @@ func (check *Checker) rememberUntyped(e syntax.Expr, lhs bool, mode operandMode,
 // via action.describef for debugging, if desired.
 func (check *Checker) later(f func()) *action {
 	i := len(check.delayed)
-	check.delayed = append(check.delayed, action{f: f})
+	check.delayed = append(check.delayed, action{version: check.version, f: f})
 	return &check.delayed[i]
 }
 
@@ -268,13 +291,14 @@ func NewChecker(conf *Config, pkg *Package, info *Info) *Checker {
 	// (previously, pkg.goVersion was mutated here: go.dev/issue/61212)
 
 	return &Checker{
-		conf:    conf,
-		ctxt:    conf.Context,
-		pkg:     pkg,
-		Info:    info,
-		version: asGoVersion(conf.GoVersion),
-		objMap:  make(map[Object]*declInfo),
-		impMap:  make(map[importKey]*Package),
+		conf:         conf,
+		ctxt:         conf.Context,
+		pkg:          pkg,
+		Info:         info,
+		objMap:       make(map[Object]*declInfo),
+		impMap:       make(map[importKey]*Package),
+		usedVars:     make(map[*Var]bool),
+		usedPkgNames: make(map[*PkgName]bool),
 	}
 }
 
@@ -282,6 +306,8 @@ func NewChecker(conf *Config, pkg *Package, info *Info) *Checker {
 // The provided files must all belong to the same package.
 func (check *Checker) initFiles(files []*syntax.File) {
 	// start with a clean slate (check.Files may be called multiple times)
+	// TODO(gri): what determines which fields are zeroed out here, vs at the end
+	// of checkFiles?
 	check.files = nil
 	check.imports = nil
 	check.dotImportMap = nil
@@ -292,6 +318,13 @@ func (check *Checker) initFiles(files []*syntax.File) {
 	check.delayed = nil
 	check.objPath = nil
 	check.cleaners = nil
+
+	// We must initialize usedVars and usedPkgNames both here and in NewChecker,
+	// because initFiles is not called in the CheckExpr or Eval codepaths, yet we
+	// want to free this memory at the end of Files ('used' predicates are
+	// only needed in the context of a given file).
+	check.usedVars = make(map[*Var]bool)
+	check.usedPkgNames = make(map[*PkgName]bool)
 
 	// determine package name and collect valid files
 	pkg := check.pkg
@@ -321,10 +354,10 @@ func (check *Checker) initFiles(files []*syntax.File) {
 	}
 	check.versions = versions
 
-	pkgVersionOk := check.version.isValid()
-	if pkgVersionOk && len(files) > 0 && check.version.cmp(go_current) > 0 {
+	pkgVersion := asGoVersion(check.conf.GoVersion)
+	if pkgVersion.isValid() && len(files) > 0 && pkgVersion.cmp(go_current) > 0 {
 		check.errorf(files[0], TooNew, "package requires newer Go version %v (application built with %v)",
-			check.version, go_current)
+			pkgVersion, go_current)
 	}
 
 	// determine Go version for each file
@@ -367,6 +400,16 @@ func versionMax(a, b goVersion) goVersion {
 	return b
 }
 
+// pushPos pushes pos onto the pos stack.
+func (check *Checker) pushPos(pos syntax.Pos) {
+	check.posStack = append(check.posStack, pos)
+}
+
+// popPos pops from the pos stack.
+func (check *Checker) popPos() {
+	check.posStack = check.posStack[:len(check.posStack)-1]
+}
+
 // A bailout panic is used for early termination.
 type bailout struct{}
 
@@ -376,6 +419,7 @@ func (check *Checker) handleBailout(err *error) {
 		// normal return or early exit
 		*err = check.firstErr
 	default:
+		// TODO(markfreeman): dump posStack if available
 		// re-panic
 		panic(p)
 	}
@@ -466,8 +510,11 @@ func (check *Checker) checkFiles(files []*syntax.File) {
 	check.seenPkgMap = nil
 	check.brokenAliases = nil
 	check.unionTypeSets = nil
+	check.usedVars = nil
+	check.usedPkgNames = nil
 	check.ctxt = nil
 
+	// TODO(gri): shouldn't the cleanup above occur after the bailout?
 	// TODO(gri) There's more memory we should release at this point.
 }
 
@@ -479,6 +526,7 @@ func (check *Checker) processDelayed(top int) {
 	// are processed in a delayed fashion) that may
 	// add more actions (such as nested functions), so
 	// this is a sufficiently bounded process.
+	savedVersion := check.version
 	for i := top; i < len(check.delayed); i++ {
 		a := &check.delayed[i]
 		if check.conf.Trace {
@@ -488,13 +536,15 @@ func (check *Checker) processDelayed(top int) {
 				check.trace(nopos, "-- delayed %p", a.f)
 			}
 		}
-		a.f() // may append to check.delayed
+		check.version = a.version // reestablish the effective Go version captured earlier
+		a.f()                     // may append to check.delayed
 		if check.conf.Trace {
 			fmt.Println()
 		}
 	}
 	assert(top <= len(check.delayed)) // stack must not have shrunk
 	check.delayed = check.delayed[:top]
+	check.version = savedVersion
 }
 
 // cleanup runs cleanup for all collected cleaners.
@@ -549,8 +599,8 @@ func (check *Checker) recordCommaOkTypesInSyntax(x syntax.Expr, t0, t1 Type) {
 			assert(tv.Type != nil) // should have been recorded already
 			pos := x.Pos()
 			tv.Type = NewTuple(
-				NewVar(pos, check.pkg, "", t0),
-				NewVar(pos, check.pkg, "", t1),
+				NewParam(pos, check.pkg, "", t0),
+				NewParam(pos, check.pkg, "", t1),
 			)
 			x.SetTypeInfo(tv)
 			p, _ := x.(*syntax.ParenExpr)

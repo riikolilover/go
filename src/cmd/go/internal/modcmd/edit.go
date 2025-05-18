@@ -90,9 +90,13 @@ like "v1.2.3" or a closed interval like "[v1.1.0,v1.1.9]". Note that
 The -tool=path and -droptool=path flags add and drop a tool declaration
 for the given path.
 
+The -ignore=path and -dropignore=path flags add and drop a ignore declaration
+for the given path.
+
 The -godebug, -dropgodebug, -require, -droprequire, -exclude, -dropexclude,
--replace, -dropreplace, -retract, -dropretract, -tool, and -droptool editing
-flags may be repeated, and the changes are applied in the order given.
+-replace, -dropreplace, -retract, -dropretract, -tool, -droptool, -ignore,
+and -dropignore editing flags may be repeated, and the changes are applied
+in the order given.
 
 The -print flag prints the final go.mod in its text format instead of
 writing it back to go.mod.
@@ -147,6 +151,10 @@ writing it back to go.mod. The JSON output corresponds to these Go types:
 		Path string
 	}
 
+	type Ignore struct {
+		Path string
+	}
+
 Retract entries representing a single version (not an interval) will have
 the "Low" and "High" fields set to the same value.
 
@@ -190,6 +198,8 @@ func init() {
 	cmdEdit.Flag.Var(flagFunc(flagDropRetract), "dropretract", "")
 	cmdEdit.Flag.Var(flagFunc(flagTool), "tool", "")
 	cmdEdit.Flag.Var(flagFunc(flagDropTool), "droptool", "")
+	cmdEdit.Flag.Var(flagFunc(flagIgnore), "ignore", "")
+	cmdEdit.Flag.Var(flagFunc(flagDropIgnore), "dropignore", "")
 
 	base.AddBuildFlagsNX(&cmdEdit.Flag)
 	base.AddChdirFlag(&cmdEdit.Flag)
@@ -337,25 +347,6 @@ func parsePath(flag, arg string) (path string) {
 		base.Fatalf("go: -%s=%s: invalid path: %v", flag, arg, err)
 	}
 	return path
-}
-
-// parsePath parses -flag=arg expecting arg to be path to a tool (allows ./)
-func parseToolPath(flag, arg string) (path string) {
-	if strings.Contains(arg, "@") {
-		base.Fatalf("go: -%s=%s: need just path, not path@version", flag, arg)
-	}
-	if arg == "." {
-		return arg
-	}
-	toCheck := arg
-	if strings.HasPrefix(arg, "./") {
-		toCheck = arg[2:]
-	}
-	if err := module.CheckImportPath(toCheck); err != nil {
-		base.Fatalf("go: -%s=%s: invalid path: %v", flag, arg, err)
-	}
-
-	return arg
 }
 
 // parsePathVersionOptional parses path[@version], using adj to
@@ -547,7 +538,7 @@ func flagDropRetract(arg string) {
 
 // flagTool implements the -tool flag.
 func flagTool(arg string) {
-	path := parseToolPath("tool", arg)
+	path := parsePath("tool", arg)
 	edits = append(edits, func(f *modfile.File) {
 		if err := f.AddTool(path); err != nil {
 			base.Fatalf("go: -tool=%s: %v", arg, err)
@@ -557,10 +548,28 @@ func flagTool(arg string) {
 
 // flagDropTool implements the -droptool flag.
 func flagDropTool(arg string) {
-	path := parseToolPath("droptool", arg)
+	path := parsePath("droptool", arg)
 	edits = append(edits, func(f *modfile.File) {
 		if err := f.DropTool(path); err != nil {
 			base.Fatalf("go: -droptool=%s: %v", arg, err)
+		}
+	})
+}
+
+// flagIgnore implements the -ignore flag.
+func flagIgnore(arg string) {
+	edits = append(edits, func(f *modfile.File) {
+		if err := f.AddIgnore(arg); err != nil {
+			base.Fatalf("go: -ignore=%s: %v", arg, err)
+		}
+	})
+}
+
+// flagDropIgnore implements the -dropignore flag.
+func flagDropIgnore(arg string) {
+	edits = append(edits, func(f *modfile.File) {
+		if err := f.DropIgnore(arg); err != nil {
+			base.Fatalf("go: -dropignore=%s: %v", arg, err)
 		}
 	})
 }
@@ -575,6 +584,7 @@ type fileJSON struct {
 	Replace   []replaceJSON
 	Retract   []retractJSON
 	Tool      []toolJSON
+	Ignore    []ignoreJSON
 }
 
 type editModuleJSON struct {
@@ -600,6 +610,10 @@ type retractJSON struct {
 }
 
 type toolJSON struct {
+	Path string
+}
+
+type ignoreJSON struct {
 	Path string
 }
 
@@ -632,6 +646,9 @@ func editPrintJSON(modFile *modfile.File) {
 	}
 	for _, t := range modFile.Tool {
 		f.Tool = append(f.Tool, toolJSON{t.Path})
+	}
+	for _, i := range modFile.Ignore {
+		f.Ignore = append(f.Ignore, ignoreJSON{i.Path})
 	}
 	data, err := json.MarshalIndent(&f, "", "\t")
 	if err != nil {

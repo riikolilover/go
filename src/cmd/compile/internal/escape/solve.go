@@ -126,7 +126,7 @@ func (b *batch) walkOne(root *location, walkgen uint32, enqueue func(*location))
 		// corresponding result parameter, then record
 		// that value flow for tagging the function
 		// later.
-		if l.isName(ir.PPARAM) {
+		if l.param {
 			if b.outlives(root, l) {
 				if !l.hasAttr(attrEscapes) && (logopt.Enabled() || base.Flag.LowerM >= 2) {
 					if base.Flag.LowerM >= 2 {
@@ -270,7 +270,7 @@ func (b *batch) outlives(l, other *location) bool {
 	// We don't know what callers do with returned values, so
 	// pessimistically we need to assume they flow to the heap and
 	// outlive everything too.
-	if l.isName(ir.PPARAMOUT) {
+	if l.paramOut {
 		// Exception: Closures can return locations allocated outside of
 		// them without forcing them to the heap, if we can statically
 		// identify all call sites. For example:
@@ -278,7 +278,7 @@ func (b *batch) outlives(l, other *location) bool {
 		//	var u int  // okay to stack allocate
 		//	fn := func() *int { return &u }()
 		//	*fn() = 42
-		if containsClosure(other.curfn, l.curfn) && !l.curfn.ClosureResultsLost() {
+		if ir.ContainsClosure(other.curfn, l.curfn) && !l.curfn.ClosureResultsLost() {
 			return false
 		}
 
@@ -304,23 +304,9 @@ func (b *batch) outlives(l, other *location) bool {
 	//	func() {
 	//		l = new(int) // must heap allocate: outlives call frame (if not inlined)
 	//	}()
-	if containsClosure(l.curfn, other.curfn) {
+	if ir.ContainsClosure(l.curfn, other.curfn) {
 		return true
 	}
 
 	return false
-}
-
-// containsClosure reports whether c is a closure contained within f.
-func containsClosure(f, c *ir.Func) bool {
-	// Common cases.
-	if f == c || c.OClosure == nil {
-		return false
-	}
-
-	// Closures within function Foo are named like "Foo.funcN..." or "Foo-rangeN".
-	// TODO(mdempsky): Better way to recognize this.
-	fn := f.Sym().Name
-	cn := c.Sym().Name
-	return len(cn) > len(fn) && cn[:len(fn)] == fn && (cn[len(fn)] == '.' || cn[len(fn)] == '-')
 }

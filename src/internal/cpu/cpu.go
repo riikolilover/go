@@ -81,9 +81,13 @@ var ARM64 struct {
 // The booleans in Loong64 contain the correspondingly named cpu feature bit.
 // The struct is padded to avoid false sharing.
 var Loong64 struct {
-	_        CacheLinePad
-	HasCRC32 bool
-	_        CacheLinePad
+	_         CacheLinePad
+	HasLSX    bool // support 128-bit vector extension
+	HasLASX   bool // support 256-bit vector extension
+	HasCRC32  bool // support CRC instruction
+	HasLAMCAS bool // support AMCAS[_DB].{B/H/W/D}
+	HasLAM_BH bool // support AM{SWAP/ADD}[_DB].{B/H} instruction
+	_         CacheLinePad
 }
 
 var MIPS64X struct {
@@ -133,13 +137,27 @@ var S390X struct {
 	_         CacheLinePad
 }
 
+// RISCV64 contains the supported CPU features and performance characteristics for riscv64
+// platforms. The booleans in RISCV64, with the exception of HasFastMisaligned, indicate
+// the presence of RISC-V extensions.
+// The struct is padded to avoid false sharing.
+var RISCV64 struct {
+	_                 CacheLinePad
+	HasFastMisaligned bool // Fast misaligned accesses
+	HasV              bool // Vector extension compatible with RVV 1.0
+	HasZbb            bool // Basic bit-manipulation extension
+	_                 CacheLinePad
+}
+
 // CPU feature variables are accessed by assembly code in various packages.
 //go:linkname X86
 //go:linkname ARM
 //go:linkname ARM64
+//go:linkname Loong64
 //go:linkname MIPS64X
 //go:linkname PPC64
 //go:linkname S390X
+//go:linkname RISCV64
 
 // Initialize examines the processor and sets the relevant variables above.
 // This is called by the runtime package early in program initialization,
